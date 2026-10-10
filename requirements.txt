@@ -1,0 +1,7 @@
+streamlit
+akshare
+pandas
+numpy
+stockstats
+openpyxl
+pyarrow
