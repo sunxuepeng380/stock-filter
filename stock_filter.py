@@ -1246,106 +1246,16 @@ if start_button:
         item["评分明细"] = detail
     final_results = sorted(final_results, key=lambda x: x.get("综合评分", 0), reverse=True)
 
-    # ===== 保存历史 =====
+        # ===== 保存历史 =====
     save_history(index_name, logic_mode, {k: str(v) for k, v in conditions.items()}, final_results)
     st.session_state["last_results"] = final_results
-    st.session_state["last_index"] = index_name
-
-    # ===== 展示 =====
-    st.divider()
-    st.subheader("🎉 最终筛选结果")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("扫描股票数", len(comp_df))
-    c2.metric("技术面命中", len(tech_passed))
-    c3.metric("最终结果", len(final_results))
-    c4.metric("已过滤", skipped)
-
-    if failed > 0:
-        with st.expander(f"⚠️ {failed} 只拉取失败"):
-            for k, v in list(fail_reasons.items())[:10]:
-                st.write(f"**{k}**: {v}")
-
-    if final_results:
-        df = pd.DataFrame(final_results)
-        col_order = ["代码", "名称", "综合评分", "最新价", "涨跌幅(%)",
-                     "PE", "PB", "ROE(%)", "总市值(亿)", "净利润增速(%)", "营收增速(%)",
-                     "日KK", "日KD", "日KJ", "周KK", "周KD", "月KK", "月KD",
-                     "RSI6", "ATR%", "命中条件", "评分明细"]
-        display_cols = [c for c in col_order if c in df.columns]
-        df_display = df[display_cols]
-
-        # 排序选项
-        sort_col1, sort_col2 = st.columns([3, 1])
-        with sort_col2:
-            sort_by = st.selectbox("排序依据", ["综合评分", "涨跌幅(%)", "最新价"] + [c for c in ["周KK", "月KK", "RSI6", "PE"] if c in df_display.columns],
-                                    index=0, key="sort_by")
-            sort_asc = st.checkbox("升序", value=False, key="sort_asc")
-        df_display = df_display.sort_values(sort_by, ascending=sort_asc).reset_index(drop=True)
-
-        # 导出按钮
-        exp1, exp2 = st.columns(2)
-        with exp1:
-            csv_data = df.to_csv(index=False, encoding="utf-8-sig")
-            st.download_button("📥 下载 CSV", data=csv_data,
-                file_name=f"筛选结果_{index_name}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-                mime="text/csv", use_container_width=True)
-        with exp2:
-            if HAS_OPENPYXL:
-                xlsx_data = export_to_excel(df)
-                st.download_button("📊 下载 Excel（带格式）", data=xlsx_data,
-                    file_name=f"筛选结果_{index_name}_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True)
-            else:
-                st.caption("安装 openpyxl 后可导出 Excel")
-
-        st.caption("💡 点击行查看K线图和详情")
-        col_left, col_right = st.columns([3, 2])
-
-        with col_left:
-            sel = st.dataframe(df_display, use_container_width=True, height=520,
-                               on_select="rerun", selection_mode="single-row", key="result_table")
-
-        with col_right:
-            selected_rows = []
-            try:
-                if sel is not None and hasattr(sel, "selection"):
-                    selected_rows = sel.selection.get("rows", []) if isinstance(sel.selection, dict) else sel.selection.rows
-            except Exception:
-                selected_rows = []
-            if selected_rows:
-                row_idx = selected_rows[0]
-                sc = str(df_display.iloc[row_idx]["代码"]).zfill(6)
-                sn = df_display.iloc[row_idx]["名称"]
-                st.markdown(f"### 📌 {sc} {sn}")
-                detail_df, _ = load_or_update_kline(sc, days=min(history_days, 250))
-                if detail_df is not None and len(detail_df) > 20:
-                    chart_df = detail_df.set_index("date")[["close"]].copy(); chart_df.columns = ["收盘价"]
-                    st.line_chart(chart_df, height=200)
-                    try:
-                        ddf = wrap(detail_df.copy())
-                        ddf.get("kdj"); ddf.get("macd"); ddf.get("atr")
-                        m1 = st.columns(3)
-                        m1[0].metric("最新价", round(detail_df["close"].iloc[-1], 2))
-                        m1[1].metric("日K", round(ddf["kdjk"].iloc[-1], 2))
-                        m1[2].metric("日D", round(ddf["kdjd"].iloc[-1], 2))
-                        m2 = st.columns(3)
-                        m2[0].metric("日J", round(ddf["kdjj"].iloc[-1], 2))
-                        m2[1].metric("MACD", round(ddf["macd"].iloc[-1], 3))
-                        m2[2].metric("ATR%", round(ddf["atr"].iloc[-1] / detail_df["close"].iloc[-1] * 100, 2))
-                    except Exception:
-                        pass
-                    recent = detail_df.tail(5)[["date", "open", "high", "low", "close", "volume"]].copy()
-                    recent["date"] = recent["date"].dt.strftime("%Y-%m-%d")
-                    recent.columns = ["日期", "开盘", "最高", "最低", "收盘", "成交量"]
-                    st.dataframe(recent, use_container_width=True, hide_index=True)
-            else:
-                st.info("👈 点击左侧表格行查看详情。")
-    else:
-        st.warning("⚠️ 没有股票满足条件。")
-        if all_scanned:
-            st.subheader("📊 已扫描快照（前20只）")
-            st.dataframe(pd.DataFrame(all_scanned).head(20), use_container_width=True)
+    st.session_state["last_all_scanned"] = all_scanned
+    st.session_state["last_tech_passed_count"] = len(tech_passed)
+    st.session_state["last_failed"] = failed
+    st.session_state["last_skipped"] = skipped
+    st.session_state["last_fail_reasons"] = fail_reasons
+    st.session_state["last_index_name"] = index_name
+    st.session_state["last_comp_count"] = len(comp_df)
 
 
 # ============================================================
@@ -1538,3 +1448,123 @@ else:
                     )
 
                     st.caption("💡 提示：卖出价用的是筛选日之后第 N 个交易日的收盘价，未考虑手续费、滑点、停牌等情况。")
+                    st.caption("💡 数据来自东方财富、新浪财经、乐咕乐股（AKShare）。缓存目录：data/。")
+                    
+
+# ============================================================
+# 结果展示（独立块：即使点击表格行触发 rerun，也能稳定显示）
+# ============================================================
+if "last_results" in st.session_state:
+    final_results = st.session_state["last_results"]
+    all_scanned = st.session_state.get("last_all_scanned", [])
+    tech_passed_count = st.session_state.get("last_tech_passed_count", 0)
+    failed = st.session_state.get("last_failed", 0)
+    skipped = st.session_state.get("last_skipped", 0)
+    fail_reasons = st.session_state.get("last_fail_reasons", {})
+    index_name_display = st.session_state.get("last_index_name", "")
+    comp_count = st.session_state.get("last_comp_count", 0)
+
+    st.divider()
+    st.subheader("🎉 最终筛选结果")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("扫描股票数", comp_count)
+    c2.metric("技术面命中", tech_passed_count)
+    c3.metric("最终结果", len(final_results))
+    c4.metric("已过滤", skipped)
+
+    if failed > 0:
+        with st.expander(f"⚠️ {failed} 只拉取失败"):
+            for k, v in list(fail_reasons.items())[:10]:
+                st.write(f"**{k}**: {v}")
+
+    if final_results:
+        df = pd.DataFrame(final_results)
+        col_order = ["代码", "名称", "综合评分", "最新价", "涨跌幅(%)",
+                     "PE", "PB", "ROE(%)", "总市值(亿)", "净利润增速(%)", "营收增速(%)",
+                     "日KK", "日KD", "日KJ", "周KK", "周KD", "月KK", "月KD",
+                     "RSI6", "ATR%", "命中条件", "评分明细"]
+        display_cols = [c for c in col_order if c in df.columns]
+        df_display = df[display_cols]
+
+        sort_col1, sort_col2 = st.columns([3, 1])
+        with sort_col2:
+            sort_by = st.selectbox(
+                "排序依据",
+                ["综合评分", "涨跌幅(%)", "最新价"] + [c for c in ["周KK", "月KK", "RSI6", "PE"] if c in df_display.columns],
+                index=0, key="sort_by",
+            )
+            sort_asc = st.checkbox("升序", value=False, key="sort_asc")
+        df_display = df_display.sort_values(sort_by, ascending=sort_asc).reset_index(drop=True)
+
+        exp1, exp2 = st.columns(2)
+        with exp1:
+            csv_data = df.to_csv(index=False, encoding="utf-8-sig")
+            st.download_button(
+                "📥 下载 CSV", data=csv_data,
+                file_name=f"筛选结果_{index_name_display}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                mime="text/csv", use_container_width=True,
+            )
+        with exp2:
+            if HAS_OPENPYXL:
+                xlsx_data = export_to_excel(df)
+                st.download_button(
+                    "📊 下载 Excel（带格式）", data=xlsx_data,
+                    file_name=f"筛选结果_{index_name_display}_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+            else:
+                st.caption("安装 openpyxl 后可导出 Excel")
+
+        st.caption("💡 点击表格中的任意一行，右侧会显示该股票的K线图和详情。")
+        col_left, col_right = st.columns([3, 2])
+
+        with col_left:
+            sel = st.dataframe(
+                df_display, use_container_width=True, height=520,
+                on_select="rerun", selection_mode="single-row", key="result_table",
+            )
+
+        with col_right:
+            selected_rows = []
+            try:
+                if sel is not None and hasattr(sel, "selection"):
+                    selected_rows = sel.selection.get("rows", []) if isinstance(sel.selection, dict) else sel.selection.rows
+            except Exception:
+                selected_rows = []
+            if selected_rows:
+                row_idx = selected_rows[0]
+                sc = str(df_display.iloc[row_idx]["代码"]).zfill(6)
+                sn = df_display.iloc[row_idx]["名称"]
+                st.markdown(f"### 📌 {sc} {sn}")
+                detail_df, _ = load_or_update_kline(sc, days=min(history_days, 250))
+                if detail_df is not None and len(detail_df) > 20:
+                    chart_df = detail_df.set_index("date")[["close"]].copy()
+                    chart_df.columns = ["收盘价"]
+                    st.line_chart(chart_df, height=200)
+                    try:
+                        ddf = wrap(detail_df.copy())
+                        ddf.get("kdj"); ddf.get("macd"); ddf.get("atr")
+                        m1 = st.columns(3)
+                        m1[0].metric("最新价", round(detail_df["close"].iloc[-1], 2))
+                        m1[1].metric("日K", round(ddf["kdjk"].iloc[-1], 2))
+                        m1[2].metric("日D", round(ddf["kdjd"].iloc[-1], 2))
+                        m2 = st.columns(3)
+                        m2[0].metric("日J", round(ddf["kdjj"].iloc[-1], 2))
+                        m2[1].metric("MACD", round(ddf["macd"].iloc[-1], 3))
+                        m2[2].metric("ATR%", round(ddf["atr"].iloc[-1] / detail_df["close"].iloc[-1] * 100, 2))
+                    except Exception:
+                        pass
+                    recent = detail_df.tail(5)[["date", "open", "high", "low", "close", "volume"]].copy()
+                    recent["date"] = recent["date"].dt.strftime("%Y-%m-%d")
+                    recent.columns = ["日期", "开盘", "最高", "最低", "收盘", "成交量"]
+                    st.dataframe(recent, use_container_width=True, hide_index=True)
+                else:
+                    st.warning("无法加载K线数据。")
+            else:
+                st.info("👈 点击左侧表格行查看详情。")
+    else:
+        st.warning("⚠️ 没有股票满足条件。")
+        if all_scanned:
+            st.subheader("📊 已扫描快照（前20只）")
+            st.dataframe(pd.DataFrame(all_scanned).head(20), use_container_width=True)
