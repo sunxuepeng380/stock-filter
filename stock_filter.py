@@ -280,15 +280,102 @@ PRESET_STRATEGIES = {
 # ============================================================
 # 数据获取
 # ============================================================
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_index_components(index_code):
+from concurrent.futures import ThreadPoolExecutor as _TPE
+import time as _time_mod
+
+def _fetch_with_timeout(func, timeout=8):
+    """带超时执行函数，超时返回None，不阻塞主线程"""
+    ex = _TPE(max_workers=1)
+    fut = ex.submit(func)
     try:
-        df = ak.index_stock_cons_csindex(symbol=index_code)
-        df = df.rename(columns={"成分券代码": "code", "成分券名称": "name"})
-        df["code"] = df["code"].astype(str).str.zfill(6)
-        return df[["code", "name"]].copy(), None
+        result = fut.result(timeout=timeout)
+        ex.shutdown(wait=False)
+        return result
+    except Exception:
+        ex.shutdown(wait=False)
+        return None
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_index_components(index_code):
+    """
+    获取指数成分股：
+    1. 本地缓存文件（30天内）→ 直接读
+    2. 联网拉取（中证官网/新浪），每个源限时8秒
+    3. 成功 → 保存到本地，下次直接读
+    4. 全部失败但有旧本地文件 → 用旧文件兜底
+    """
+    cache_file = os.path.join("data", f"components_{index_code}.csv")
+
+    # ---------- 优先本地缓存 ----------
+    if os.path.exists(cache_file):
+        try:
+            age_days = (_time_mod.time() - os.path.getmtime(cache_file)) / 86400
+            if age_days < 30:
+                df = pd.read_csv(cache_file, dtype={"code": str})
+                if not df.empty and "code" in df.columns and "name" in df.columns:
+                    df["code"] = df["code"].astype(str).str.zfill(6)
+                    return df[["code", "name"]].copy(), None
+        except Exception:
+            pass
+
+    last_err = ""
+
+    # ---------- 源1：中证指数官网（超时8秒） ----------
+    def _try_csindex():
+        return ak.index_stock_cons_csindex(symbol=index_code)
+    try:
+        df = _fetch_with_timeout(_try_csindex, timeout=8)
+        if df is not None and not df.empty:
+            df = df.rename(columns={"成分券代码": "code", "成分券名称": "name"})
+            df["code"] = df["code"].astype(str).str.zfill(6)
+            result = df[["code", "name"]].copy()
+            try:
+                result.to_csv(cache_file, index=False)
+            except Exception:
+                pass
+            return result, None
+        else:
+            last_err = "中证官网超时"
     except Exception as e:
-        return None, str(e)
+        last_err = f"中证官网: {str(e)[:60]}"
+
+    # ---------- 源2：新浪（超时8秒） ----------
+    def _try_sina():
+        return ak.index_stock_cons(symbol=index_code)
+    try:
+        df = _fetch_with_timeout(_try_sina, timeout=8)
+        if df is not None and not df.empty:
+            rename_map = {}
+            for c in df.columns:
+                cs = str(c)
+                if "代码" in cs: rename_map[c] = "code"
+                if "名称" in cs: rename_map[c] = "name"
+            df = df.rename(columns=rename_map)
+            if "code" in df.columns and "name" in df.columns:
+                df["code"] = df["code"].astype(str).str.zfill(6)
+                result = df[["code", "name"]].copy()
+                try:
+                    result.to_csv(cache_file, index=False)
+                except Exception:
+                    pass
+                return result, None
+        else:
+            last_err += " | 新浪超时"
+    except Exception as e:
+        last_err += f" | 新浪: {str(e)[:60]}"
+
+    # ---------- 兜底：本地有旧文件就用 ----------
+    if os.path.exists(cache_file):
+        try:
+            df = pd.read_csv(cache_file, dtype={"code": str})
+            if not df.empty and "code" in df.columns and "name" in df.columns:
+                df["code"] = df["code"].astype(str).str.zfill(6)
+                return df[["code", "name"]].copy(), None
+        except Exception:
+            pass
+
+    return None, f"全部源失败 - {last_err}"
 
 
 def fetch_kline_from_network(stock_code, days=200):
@@ -338,34 +425,54 @@ def fetch_kline_from_network(stock_code, days=200):
 
 
 def load_or_update_kline(stock_code, days=200):
+    """
+    加载K线：本地缓存优先，只补拉缺失的近期数据。
+    判断逻辑：缓存最后一天距今 ≤ 3 个自然日，就认为足够新，直接用本地。
+    （3 天足以覆盖周末，也能容忍清明/中秋等小长假）
+    """
     file_path = os.path.join(DATA_DIR, f"{stock_code}.parquet")
     today = pd.Timestamp.today().normalize()
-    last_trading_day = today - pd.Timedelta(days=1) if today.weekday() == 0 else today
+
+    # ---------- 本地已有缓存 ----------
     if os.path.exists(file_path):
         try:
             local_df = pd.read_parquet(file_path)
             local_df["date"] = pd.to_datetime(local_df["date"])
             local_df = local_df.sort_values("date").reset_index(drop=True)
-            if not local_df.empty and local_df["date"].max() >= last_trading_day:
-                if len(local_df) > days:
-                    local_df = local_df.tail(days).reset_index(drop=True)
-                return local_df, None
-            new_df, err = fetch_kline_from_network(stock_code, days=60)
-            if new_df is not None:
-                combined = pd.concat([local_df, new_df], ignore_index=True)
-                combined = combined.drop_duplicates(subset=["date"], keep="last")
-                combined = combined.sort_values("date").reset_index(drop=True)
-                combined.to_parquet(file_path, index=False)
-                if len(combined) > days:
-                    combined = combined.tail(days).reset_index(drop=True)
-                return combined, None
-            if len(local_df) > days:
-                local_df = local_df.tail(days).reset_index(drop=True)
-            return local_df, None
+
+            if not local_df.empty:
+                days_diff = (today - local_df["date"].max()).days
+                # 缓存足够新（3 天内），直接返回
+                if days_diff <= 3:
+                    if len(local_df) > days:
+                        local_df = local_df.tail(days).reset_index(drop=True)
+                    return local_df, None
+
+                # 缓存太旧，补拉最近 60 天
+                new_df, err = fetch_kline_from_network(stock_code, days=60)
+                if new_df is not None and not new_df.empty:
+                    combined = pd.concat([local_df, new_df], ignore_index=True)
+                    combined = combined.drop_duplicates(subset=["date"], keep="last")
+                    combined = combined.sort_values("date").reset_index(drop=True)
+                    try:
+                        combined.to_parquet(file_path, index=False)
+                    except Exception:
+                        pass
+                    if len(combined) > days:
+                        combined = combined.tail(days).reset_index(drop=True)
+                    return combined, None
+                else:
+                    # 补拉失败，用旧缓存兜底
+                    if len(local_df) > days:
+                        local_df = local_df.tail(days).reset_index(drop=True)
+                    return local_df, None
         except Exception:
+            # 缓存读失败，走下面的全量拉取
             pass
+
+    # ---------- 本地无缓存，全量拉取 ----------
     df, err = fetch_kline_from_network(stock_code, days=days)
-    if df is not None:
+    if df is not None and not df.empty:
         try:
             if len(df) > days:
                 df = df.tail(days).reset_index(drop=True)
