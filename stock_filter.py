@@ -183,6 +183,12 @@ def summarize_conditions(conditions_json):
     if blw.get("enabled"):
         parts.append(f"跌破{blw.get('n')}日新低")
 
+    # 连续涨跌
+    stk = _to_dict(c.get("streak"))
+    if stk.get("enabled"):
+        d = "涨" if stk.get("direction") == "up" else "跌"
+        parts.append(f"连续{d}{stk.get('op')}{stk.get('days')}天")
+
     return " | ".join(parts) if parts else "（无条件）"
 
 
@@ -422,16 +428,67 @@ def fetch_kline_from_network(stock_code, days=200):
     except Exception as e:
         last_err += f" | 新浪: {str(e)[:50]}"
     return None, last_err
+# ============================================================
+# 【新增】交易日历 & 除权检测辅助函数
+# ============================================================
+@st.cache_data(ttl=86400, show_spinner=False)
+def _get_trade_dates():
+    """获取A股交易日历（用于判断缓存是否已是最新交易日）"""
+    try:
+        df = ak.tool_trade_date_hist_sina()
+        return set(pd.to_datetime(df["trade_date"]).dt.normalize())
+    except Exception:
+        return None
 
+
+def _check_seam_jump(old_df, new_df, tolerance=0.02):
+    """
+    检查新旧数据接缝处是否出现价格跳变（说明发生了除权）。
+    old_df: 本地缓存    new_df: 新拉取的数据
+    tolerance: 允许的最大相对差（默认2%）
+    返回 True 表示检测到跳变，需要全量重拉
+    """
+    try:
+        old_dates = set(old_df["date"])
+        overlap = new_df[new_df["date"].isin(old_dates)]
+        if overlap.empty or len(overlap) < 2:
+            return False  # 没有重叠，无法判断
+        merged = pd.merge(
+            overlap[["date", "close"]],
+            old_df[["date", "close"]],
+            on="date", suffixes=("_new", "_old"),
+        ).tail(3)
+        if merged.empty:
+            return False
+        diffs = (merged["close_new"] - merged["close_old"]).abs() / merged["close_old"]
+        return bool((diffs > tolerance).any())
+    except Exception:
+        return False
 
 def load_or_update_kline(stock_code, days=200):
     """
     加载K线：本地缓存优先，只补拉缺失的近期数据。
-    判断逻辑：缓存最后一天距今 ≤ 3 个自然日，就认为足够新，直接用本地。
-    （3 天足以覆盖周末，也能容忍清明/中秋等小长假）
+    改进点：
+      1. 用交易日历判断缓存是否已是最新交易日（不再用自然日）
+      2. 检测新旧数据接缝处价格跳变（前复权除权）→ 触发全量重拉
+      3. 缺口过大（>120天）→ 直接全量重拉，避免中间断层
+      4. 原子写入，避免缓存损坏
     """
     file_path = os.path.join(DATA_DIR, f"{stock_code}.parquet")
     today = pd.Timestamp.today().normalize()
+
+    def _tail(df):
+        if len(df) > days:
+            df = df.tail(days).reset_index(drop=True)
+        return df
+
+    def _save(df):
+        try:
+            tmp = file_path + ".tmp"
+            df.to_parquet(tmp, index=False)
+            os.replace(tmp, file_path)
+        except Exception:
+            pass
 
     # ---------- 本地已有缓存 ----------
     if os.path.exists(file_path):
@@ -441,44 +498,64 @@ def load_or_update_kline(stock_code, days=200):
             local_df = local_df.sort_values("date").reset_index(drop=True)
 
             if not local_df.empty:
-                days_diff = (today - local_df["date"].max()).days
-                # 缓存足够新（3 天内），直接返回
-                if days_diff <= 3:
-                    if len(local_df) > days:
-                        local_df = local_df.tail(days).reset_index(drop=True)
-                    return local_df, None
+                last_cached = local_df["date"].max().normalize()
 
-                # 缓存太旧，补拉最近 60 天
-                new_df, err = fetch_kline_from_network(stock_code, days=60)
+                # 用交易日历判断是否需要更新
+                trade_dates = _get_trade_dates()
+                if trade_dates is not None:
+                    past_td = [d for d in trade_dates if d <= today]
+                    latest_td = max(past_td) if past_td else today
+                    need_update = last_cached < latest_td
+                else:
+                    # 兜底：拿不到日历时，自然日超过 3 天才更新
+                    need_update = (today - last_cached).days > 3
+
+                if not need_update:
+                    return _tail(local_df), None
+
+                gap_days = (today - last_cached).days
+
+                # 缺口过大 → 全量重拉（避免中间断层）
+                if gap_days > 120:
+                    df, err = fetch_kline_from_network(stock_code, days=days)
+                    if df is not None and not df.empty:
+                        df = _tail(df)
+                        _save(df)
+                        return df, None
+                    return _tail(local_df), None
+
+                # 缺口较小 → 只补最近一段
+                fetch_days = max(60, gap_days + 30)
+                new_df, err = fetch_kline_from_network(stock_code, days=fetch_days)
+
                 if new_df is not None and not new_df.empty:
+                    # 检测除权跳变（前复权历史值被重算）
+                    if _check_seam_jump(local_df, new_df):
+                        df, err2 = fetch_kline_from_network(stock_code, days=days)
+                        if df is not None and not df.empty:
+                            df = _tail(df)
+                            _save(df)
+                            return df, None
+                        return _tail(local_df), None
+
+                    # 合并新旧数据
                     combined = pd.concat([local_df, new_df], ignore_index=True)
                     combined = combined.drop_duplicates(subset=["date"], keep="last")
                     combined = combined.sort_values("date").reset_index(drop=True)
-                    try:
-                        combined.to_parquet(file_path, index=False)
-                    except Exception:
-                        pass
-                    if len(combined) > days:
-                        combined = combined.tail(days).reset_index(drop=True)
+                    combined = _tail(combined)
+                    _save(combined)
                     return combined, None
                 else:
                     # 补拉失败，用旧缓存兜底
-                    if len(local_df) > days:
-                        local_df = local_df.tail(days).reset_index(drop=True)
-                    return local_df, None
+                    return _tail(local_df), None
         except Exception:
-            # 缓存读失败，走下面的全量拉取
-            pass
+            pass  # 缓存读失败，走下面全量拉取
 
     # ---------- 本地无缓存，全量拉取 ----------
     df, err = fetch_kline_from_network(stock_code, days=days)
     if df is not None and not df.empty:
-        try:
-            if len(df) > days:
-                df = df.tail(days).reset_index(drop=True)
-            df.to_parquet(file_path, index=False)
-        except Exception:
-            pass
+        df = _tail(df)
+        _save(df)
     return df, err
 
 
@@ -548,7 +625,36 @@ def to_weekly(kline_df):
                                         "close": "last", "volume": "sum"}).dropna()
     return weekly.reset_index()
 
+# ============================================================
+# 【新增】通达信标准 KDJ 计算（与同花顺、通达信一致）
+# ============================================================
+def calc_kdj(df, n=9, m1=3, m2=3):
+    """
+    RSV = (CLOSE - LLV(LOW, N)) / (HHV(HIGH, N) - LLV(LOW, N)) * 100
+    K   = SMA(RSV, M1, 1)
+    D   = SMA(K,   M2, 1)
+    J   = 3*K - 2*D
+    说明：通达信 SMA(X, N, 1) 等价于 pandas 的 ewm(alpha=1/N, adjust=False)
+    """
+    out = df.copy()
+    low_n  = out["low"].rolling(window=n, min_periods=1).min()
+    high_n = out["high"].rolling(window=n, min_periods=1).max()
 
+    denom = high_n - low_n
+    rsv = (out["close"] - low_n) / denom.replace(0, np.nan) * 100
+    rsv = rsv.fillna(50)  # 一字板/停牌等分母为0时，用中性值50
+
+    k = rsv.ewm(alpha=1 / m1, adjust=False).mean()
+    d = k.ewm(alpha=1 / m2, adjust=False).mean()
+    j = 3 * k - 2 * d
+
+    out["kdjk"] = k
+    out["kdjd"] = d
+    out["kdjj"] = j
+    # 手工算金叉/死叉（stockstats 的 kdjk_xu_kdjd 我们不打算再用了）
+    out["kdjk_xu_kdjd"] = (out["kdjk"] > out["kdjd"]) & (out["kdjk"].shift(1) <= out["kdjd"].shift(1))
+    out["kdjd_xu_kdjk"] = (out["kdjd"] > out["kdjk"]) & (out["kdjd"].shift(1) <= out["kdjk"].shift(1))
+    return out
 def to_monthly(kline_df):
     """日K聚合为月K（月末）"""
     df = kline_df.copy()
@@ -598,7 +704,14 @@ def check_stock(kline_df, conds):
         return [], 0, {}
     try:
         df = wrap(kline_df.copy())
-        df.get("boll"); df.get("kdj"); df.get("macd"); df.get("atr")
+        df.get("boll"); df.get("macd"); df.get("atr")
+        # 用通达信标准算法覆盖 stockstats 的 KDJ
+        kdj_df = calc_kdj(kline_df)
+        df["kdjk"] = kdj_df["kdjk"].values
+        df["kdjd"] = kdj_df["kdjd"].values
+        df["kdjj"] = kdj_df["kdjj"].values
+        df["kdjk_xu_kdjd"] = kdj_df["kdjk_xu_kdjd"].values
+        df["kdjd_xu_kdjk"] = kdj_df["kdjd_xu_kdjk"].values
     except Exception:
         return [], 0, {}
 
@@ -615,8 +728,9 @@ def check_stock(kline_df, conds):
         enabled_count += 1
         fast, slow = int(c["fast"]), int(c["slow"])
         try:
-            df[f"close_{fast}_sma_xu_close_{slow}_sma"]
-            if df[f"close_{fast}_sma_xu_close_{slow}_sma"].iloc[-1]:
+            col_name = f"close_{fast}_sma_xu_close_{slow}_sma"
+            _ = df[col_name]  # 显式赋值给 _ ，明确表示"只用一次，不显示"
+            if df[col_name].iloc[-1]:
                 hits.append(f"MA金叉({fast}↑{slow})")
         except Exception:
             pass
@@ -639,7 +753,7 @@ def check_stock(kline_df, conds):
         enabled_count += 1
         period = int(c["period"])
         try:
-            ma_col = f"close_{period}_sma"; df[ma_col]
+            ma_col = f"close_{period}_sma"; _ = df[ma_col]
             close, ma_v = df["close"].iloc[-1], df[ma_col].iloc[-1]
             ok = (close > ma_v) if c["relation"] == "above" else (close < ma_v)
             if ok:
@@ -653,7 +767,7 @@ def check_stock(kline_df, conds):
         enabled_count += 1
         period = int(c["period"]); th = float(c["value"])
         try:
-            ma_col = f"close_{period}_sma"; df[ma_col]
+            ma_col = f"close_{period}_sma"; _ = df[ma_col]
             close, ma_v = df["close"].iloc[-1], df[ma_col].iloc[-1]
             if ma_v > 0:
                 dev = (close - ma_v) / ma_v * 100
@@ -712,7 +826,7 @@ def check_stock(kline_df, conds):
                 v = df[col].iloc[-1]
                 ok = (v > sub["value"]) if sub["op"] == ">" else (v < sub["value"])
                 if ok:
-                    hits.append(f"日K{key}{sub['op']}{sub['value']}(={v:.1f})")
+                   hits.append(f"日{key}{sub['op']}{sub['value']}(={v:.1f})")
                 snapshot[f"日{key}"] = round(v, 2)
             except Exception:
                 pass
@@ -735,7 +849,7 @@ def check_stock(kline_df, conds):
         try:
             weekly = to_weekly(kline_df)
             if len(weekly) >= 12:
-                wdf = wrap(weekly); wdf.get("kdj")
+                wdf = calc_kdj(weekly)
                 for key, col in [("K", "kdjk"), ("D", "kdjd"), ("J", "kdjj")]:
                     sub = c.get(key, {})
                     if sub.get("enabled"):
@@ -743,7 +857,7 @@ def check_stock(kline_df, conds):
                         v = wdf[col].iloc[-1]
                         ok = (v > sub["value"]) if sub["op"] == ">" else (v < sub["value"])
                         if ok:
-                            hits.append(f"周K{key}{sub['op']}{sub['value']}(={v:.1f})")
+                            hits.append(f"周{key}{sub['op']}{sub['value']}(={v:.1f})")
                         snapshot[f"周{key}"] = round(v, 2)
         except Exception:
             pass
@@ -754,7 +868,7 @@ def check_stock(kline_df, conds):
         try:
             monthly = to_monthly(kline_df)
             if len(monthly) >= 6:
-                mdf = wrap(monthly); mdf.get("kdj")
+                mdf = calc_kdj(monthly)
                 for key, col in [("K", "kdjk"), ("D", "kdjd"), ("J", "kdjj")]:
                     sub = c.get(key, {})
                     if sub.get("enabled"):
@@ -762,7 +876,7 @@ def check_stock(kline_df, conds):
                         v = mdf[col].iloc[-1]
                         ok = (v > sub["value"]) if sub["op"] == ">" else (v < sub["value"])
                         if ok:
-                            hits.append(f"月K{key}{sub['op']}{sub['value']}(={v:.1f})")
+                            hits.append(f"月{key}{sub['op']}{sub['value']}(={v:.1f})")
                         snapshot[f"月{key}"] = round(v, 2)
         except Exception:
             pass
@@ -773,7 +887,7 @@ def check_stock(kline_df, conds):
         enabled_count += 1
         period = int(c["period"])
         try:
-            col = f"rsi_{period}"; df[col]
+            col = f"rsi_{period}"; _ = df[col]
             v = df[col].iloc[-1]
             ok = (v > c["value"]) if c["op"] == ">" else (v < c["value"])
             if ok:
@@ -852,6 +966,31 @@ def check_stock(kline_df, conds):
             snapshot["ATR%"] = round(atr_pct, 2)
         except Exception:
             pass
+    # 18. 连续涨跌天数
+    c = conds.get("streak", {})
+    if c.get("enabled"):
+        enabled_count += 1
+        try:
+            direction = c["direction"]
+            op = c["op"]
+            threshold = int(c["days"])
+            closes = df["close"].values
+            streak = 0
+            for i in range(len(closes) - 1, 0, -1):
+                diff = closes[i] - closes[i - 1]
+                if direction == "up" and diff > 0:
+                    streak += 1
+                elif direction == "down" and diff < 0:
+                    streak += 1
+                else:
+                    break
+            ok = (streak >= threshold) if op == ">=" else (streak <= threshold)
+            if ok:
+                hits.append(f"连续{'涨' if direction == 'up' else '跌'}{streak}天")
+            snapshot["连续天数"] = streak if direction == "up" else -streak
+        except Exception:
+            pass
+
 
     return hits, enabled_count, snapshot
 
@@ -1166,7 +1305,7 @@ with st.sidebar:
             wk_j_v = st.number_input("周J阈值", -100.0, 200.0, 0.0, 1.0, key="ui_wk_j_v", disabled=not wk_j_on)
 
     # ---------- 月线 KDJ（新增）----------
-    with st.expander("🔱 月线 KDJ（新增）", expanded=False):
+    with st.expander("🔱 月线 KDJ", expanded=False):
         st.caption("月K数据需≥6个月，建议历史K线天数≥250")
         mk_on = st.checkbox("月线 KDJ 数值筛选", value=False, key="ui_mkdj_on")
         mk_k_on = st.checkbox("月K值", value=False, key="ui_mk_k_on", disabled=not mk_on)
@@ -1215,6 +1354,19 @@ with st.sidebar:
         bh_n = st.number_input("N 日##bh", 5, 250, 60, 5, key="ui_bh_n", disabled=not bh_on)
         bl_on = st.checkbox("跌破 N 日新低", value=False, key="ui_bl_on")
         bl_n = st.number_input("N 日##bl", 5, 250, 60, 5, key="ui_bl_n", disabled=not bl_on)
+        
+        # 连续涨跌
+        streak_on = st.checkbox("连续涨/跌天数", value=False, key="ui_streak_on")
+        streak_direction = st.radio("方向##streak", ["连续上涨", "连续下跌"],
+                                    horizontal=True, key="ui_streak_dir",
+                                    disabled=not streak_on)
+        sc1, sc2 = st.columns(2)
+        with sc1:
+            streak_op = st.selectbox("条件##streak", [">=", "<="],
+                                     key="ui_streak_op", disabled=not streak_on)
+        with sc2:
+            streak_days = st.number_input("天数##streak", 1, 30, 3, 1,
+                                          key="ui_streak_days", disabled=not streak_on)
 
     # ---------- 单只股票体检 ----------
     st.divider()
@@ -1247,9 +1399,17 @@ with st.sidebar:
             else:
                 try:
                     tdf = wrap(t_df.copy())
-                    tdf.get("kdj"); tdf.get("macd"); tdf.get("atr"); tdf["rsi_6"]
-                    tw = to_weekly(t_df); wdf = wrap(tw.copy()); wdf.get("kdj")
-                    tm = to_monthly(t_df); mdf = wrap(tm.copy()); mdf.get("kdj")
+                    tdf.get("macd"); tdf.get("atr"); _ = tdf["rsi_6"]
+                    tdf_kdj = calc_kdj(t_df)
+                    tdf["kdjk"] = tdf_kdj["kdjk"].values
+                    tdf["kdjd"] = tdf_kdj["kdjd"].values
+                    tdf["kdjj"] = tdf_kdj["kdjj"].values
+
+                    tw  = to_weekly(t_df)
+                    wdf = calc_kdj(tw)
+
+                    tm  = to_monthly(t_df)
+                    mdf = calc_kdj(tm)
 
                     st.success(f"✅ {t_df['date'].max().strftime('%Y-%m-%d')}")
                     chart_df = t_df.set_index("date")[["close"]].copy(); chart_df.columns = ["收盘价"]
@@ -1299,6 +1459,7 @@ if vp_on:        active.append(f"✅ {vp_mode}")
 if atr_on:       active.append(f"✅ ATR{atr_op}{atr_val}%")
 if bh_on:        active.append(f"✅ 突破{bh_n}日新高")
 if bl_on:        active.append(f"✅ 跌破{bl_n}日新低")
+if streak_on:    active.append(f"✅ {streak_direction} {streak_op} {streak_days}天")
 
 if not active:
     st.warning("⚠️ 未启用任何筛选条件")
@@ -1349,6 +1510,12 @@ if start_button:
         "atr": {"enabled": atr_on, "op": atr_op, "value": atr_val},
         "break_high": {"enabled": bh_on, "n": bh_n},
         "break_low":  {"enabled": bl_on, "n": bl_n},
+        "streak": {
+            "enabled": streak_on,
+            "direction": "up" if "涨" in streak_direction else "down",
+            "op": streak_op,
+            "days": streak_days,
+        },
     }
     use_and = logic_mode.startswith("同时")
 
@@ -1544,15 +1711,21 @@ else:
             else:
                 st.error("清空失败，请重试。")
 
-    hist_id = st.selectbox("查看某次详情", ["不查看"] + [f"#{r['id']} - {r['run_time']} ({r['result_count']}只)"
-                                                        for _, r in hist_df.iterrows()],
-                            key="hist_sel")
+    hist_id = st.selectbox(
+        "查看某次详情",
+        ["不查看"] + [
+            f"#{r['id']} - {r['run_time']} | {r['index_name']} | {r['result_count']}只"
+            for _, r in hist_df.iterrows()
+        ],
+        key="hist_sel",
+    )
     if hist_id != "不查看":
         try:
             hid = int(hist_id.split(" ")[0].replace("#", ""))
             detail = load_history_detail(hid)
             if detail and detail["results"]:
-                st.markdown(f"**{detail['run_time']} | {detail['index_name']}**")
+                idx_name = detail.get("index_name") or "未知指数"
+                st.markdown(f"**{detail['run_time']} | {idx_name}**")
                 hdf = pd.DataFrame(detail["results"])
                 if "综合评分" in hdf.columns:
                     hdf = hdf.sort_values("综合评分", ascending=False)
@@ -1880,7 +2053,7 @@ if "last_results" in st.session_state:
         with sort_col2:
             sort_by = st.selectbox(
                 "排序依据",
-                ["综合评分", "涨跌幅(%)", "最新价"] + [c for c in ["周KK", "月KK", "RSI6", "PE"] if c in df_display.columns],
+                ["综合评分", "涨跌幅(%)", "最新价"] + [c for c in ["周K", "月K", "RSI6", "PE"] if c in df_display.columns],
                 index=0, key="sort_by",
             )
             sort_asc = st.checkbox("升序", value=False, key="sort_asc")
@@ -1934,7 +2107,7 @@ if "last_results" in st.session_state:
                     st.line_chart(chart_df, height=200)
                     try:
                         ddf = wrap(detail_df.copy())
-                        ddf.get("kdj"); ddf.get("macd"); ddf.get("atr")
+                        _ = ddf.get("kdj"); _ = ddf.get("macd"); _ = ddf.get("atr")
                         m1 = st.columns(3)
                         m1[0].metric("最新价", round(detail_df["close"].iloc[-1], 2))
                         m1[1].metric("日K", round(ddf["kdjk"].iloc[-1], 2))
