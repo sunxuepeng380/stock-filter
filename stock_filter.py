@@ -1068,7 +1068,7 @@ with st.sidebar:
     with st.expander("📖 参数说明（强烈建议先看一遍）", expanded=False):
         st.markdown("""
 ### 🎯 通用参数
-- **股票池**：从哪个指数选股。沪深300大盘蓝筹、中证A50核心资产、中证A500中盘成长。**股票池越大，筛选时间越长**。
+- **股票池**：从哪个指数选股。沪深300大盘蓝筹、中证A50核心资产、中证A100行业龙头核心资产、中证A500中盘成长。**股票池越大，筛选时间越长**。
 - **历史K线天数**：拉取多少天的日线。**越大越准，但越慢**。
   - 日线KDJ：≥80 天足够
   - 周线KDJ：≥150 天
@@ -1144,7 +1144,7 @@ with st.sidebar:
 
     st.header("⚙️ 设置")
     index_name = st.selectbox("股票池", list(INDEX_CODE_MAP.keys()), index=0, key="sel_idx")
-    history_days = st.slider("历史K线天数", 80, 600, 250, 10, key="sld_days")
+    history_days = st.slider("历史K线天数", 80, 600, 400, 10, key="sld_days")
     logic_mode = st.radio("条件逻辑", ["同时满足全部 (AND)", "满足任意一个 (OR)"], index=0, key="rd_logic")
 
     # ---------- 预设策略 ----------
