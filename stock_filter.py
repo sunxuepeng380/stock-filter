@@ -118,7 +118,6 @@ def summarize_conditions(conditions_json):
         return ""
     parts = []
 
-    # 均线
     ma = _to_dict(c.get("ma_golden"))
     if ma.get("enabled"):
         parts.append(f"MA{ma.get('fast')}↑{ma.get('slow')}")
@@ -131,7 +130,6 @@ def summarize_conditions(conditions_json):
     if dev.get("enabled"):
         parts.append(f"偏离MA{dev.get('period')}{dev.get('op')}{dev.get('value')}%")
 
-    # MACD
     mc = _to_dict(c.get("macd_cross"))
     if mc.get("enabled"):
         parts.append("MACD" + ("金叉" if mc.get("mode") == "golden" else "死叉"))
@@ -139,12 +137,10 @@ def summarize_conditions(conditions_json):
     if mh.get("enabled"):
         parts.append("MACD柱" + ("由负转正" if mh.get("mode") == "turn_pos" else "由正转负"))
 
-    # BOLL
     bl = _to_dict(c.get("boll"))
     if bl.get("enabled"):
         parts.append(f"BOLL:{bl.get('mode')}")
 
-    # KDJ 日/周/月（每个周期内部还有 K/D/J 三层嵌套）
     for period_key, label in [("kdj_daily", "日"), ("kdj_weekly", "周"), ("kdj_monthly", "月")]:
         kk = _to_dict(c.get(period_key))
         for k in ["K", "D", "J"]:
@@ -152,17 +148,14 @@ def summarize_conditions(conditions_json):
             if sub.get("enabled"):
                 parts.append(f"{label}{k}{sub.get('op')}{sub.get('value')}")
 
-    # KDJ金叉
     kc = _to_dict(c.get("kdj_cross"))
     if kc.get("enabled"):
         parts.append("KDJ" + ("金叉" if kc.get("mode") == "golden" else "死叉"))
 
-    # RSI
     rsi = _to_dict(c.get("rsi"))
     if rsi.get("enabled"):
         parts.append(f"RSI{rsi.get('period')}{rsi.get('op')}{rsi.get('value')}")
 
-    # 量
     vol = _to_dict(c.get("volume"))
     if vol.get("enabled"):
         parts.append(f"放量{vol.get('multiple')}倍")
@@ -170,12 +163,10 @@ def summarize_conditions(conditions_json):
     if vp.get("enabled"):
         parts.append("量增价升" if vp.get("mode") == "up" else "量缩价跌")
 
-    # ATR
     atr = _to_dict(c.get("atr"))
     if atr.get("enabled"):
         parts.append(f"ATR{atr.get('op')}{atr.get('value')}%")
 
-    # 突破/新低
     bh = _to_dict(c.get("break_high"))
     if bh.get("enabled"):
         parts.append(f"突破{bh.get('n')}日新高")
@@ -183,7 +174,6 @@ def summarize_conditions(conditions_json):
     if blw.get("enabled"):
         parts.append(f"跌破{blw.get('n')}日新低")
 
-    # 连续涨跌
     stk = _to_dict(c.get("streak"))
     if stk.get("enabled"):
         d = "涨" if stk.get("direction") == "up" else "跌"
@@ -209,20 +199,20 @@ def load_history_detail(history_id):
         }
     except Exception:
         return None
+
+
 def delete_history(history_id):
-    """删除指定ID的历史记录"""
     try:
         conn = sqlite3.connect(HISTORY_DB)
         conn.execute("DELETE FROM screening_history WHERE id=?", (history_id,))
         conn.commit()
         conn.close()
         return True
-    except Exception as e:
+    except Exception:
         return False
 
 
 def clear_all_history():
-    """清空所有历史记录"""
     try:
         conn = sqlite3.connect(HISTORY_DB)
         conn.execute("DELETE FROM screening_history")
@@ -289,6 +279,20 @@ PRESET_STRATEGIES = {
 from concurrent.futures import ThreadPoolExecutor as _TPE
 import time as _time_mod
 
+# 【修复2】每个指数的理论成分股数量，用于校验数据源是否返回了正确数据
+# 【修复2】每个指数的理论成分股数量，用于校验数据源是否返回了正确数据
+INDEX_EXPECTED_COUNT = {
+    "000300": 300,    # 沪深300
+    "930050": 50,     # 中证A50
+    "000903": 100,    # 中证A100
+    "000510": 500,    # 中证A500
+}
+
+# 【补丁A】新浪 index_stock_cons 对这几个 2024 年后新发布的指数不收录，
+# 一旦 fallback 会返回全市场/错误页面数据，因此直接跳过新浪源
+SINA_UNSUPPORTED = {"930050", "000903", "000510"}
+
+
 def _fetch_with_timeout(func, timeout=8):
     """带超时执行函数，超时返回None，不阻塞主线程"""
     ex = _TPE(max_workers=1)
@@ -301,15 +305,47 @@ def _fetch_with_timeout(func, timeout=8):
         ex.shutdown(wait=False)
         return None
 
+def _is_valid_components(df, index_code):
+    """
+    【修复2】校验成分股数据是否合理：
+      1. 数量必须达到理论值的 60% 以上（容忍指数调整/退市导致的小幅偏差）
+      2. 不能明显超过理论值（比如 A500 返回 3000 只 → 肯定错了）
+      3. 代码列不能大量重复
+      4. 【补丁B】所有代码必须是 6 位纯数字
+    """
+    if df is None or df.empty or "code" not in df.columns:
+        return False, "空数据"
+    n = len(df)
+    expected = INDEX_EXPECTED_COUNT.get(index_code)
+    if expected is None:
+        if n < 5:
+            return False, f"数量过少({n})"
+    else:
+        low = int(expected * 0.6)
+        high = int(expected * 1.4)
+        if n < low:
+            return False, f"数量过少({n}，期望约{expected})"
+        if n > high:
+            return False, f"数量异常偏多({n}，期望约{expected})"
+    # 重复率
+    dup_ratio = df["code"].duplicated().sum() / max(n, 1)
+    if dup_ratio > 0.05:
+        return False, f"代码重复率过高({dup_ratio:.0%})"
+    # 【补丁B】所有代码必须是 6 位纯数字
+    codes = df["code"].astype(str).str.strip()
+    if not codes.str.match(r"^\d{6}$").all():
+        bad = codes[~codes.str.match(r"^\d{6}$")].head(3).tolist()
+        return False, f"存在非6位数字代码（示例：{bad}）"
+    return True, ""
 
 @st.cache_data(ttl=300, show_spinner=False)
 def get_index_components(index_code):
     """
     获取指数成分股：
-    1. 本地缓存文件（30天内）→ 直接读
+    1. 本地缓存文件（30天内）→ 直接读（【修复2】读出来后会校验）
     2. 联网拉取（中证官网/新浪），每个源限时8秒
-    3. 成功 → 保存到本地，下次直接读
-    4. 全部失败但有旧本地文件 → 用旧文件兜底
+    3. 只有通过校验 → 保存到本地
+    4. 全部失败但有旧本地文件 → 用旧文件兜底（同样会校验）
     """
     cache_file = os.path.join("data", f"components_{index_code}.csv")
 
@@ -319,9 +355,17 @@ def get_index_components(index_code):
             age_days = (_time_mod.time() - os.path.getmtime(cache_file)) / 86400
             if age_days < 30:
                 df = pd.read_csv(cache_file, dtype={"code": str})
-                if not df.empty and "code" in df.columns and "name" in df.columns:
+                if "code" in df.columns and "name" in df.columns:
                     df["code"] = df["code"].astype(str).str.zfill(6)
-                    return df[["code", "name"]].copy(), None
+                    result = df[["code", "name"]].copy()
+                    ok, why = _is_valid_components(result, index_code)
+                    if ok:
+                        return result, None
+                    # 【修复2】脏缓存：直接删掉，走联网重新拉
+                    try:
+                        os.remove(cache_file)
+                    except Exception:
+                        pass
         except Exception:
             pass
 
@@ -331,53 +375,73 @@ def get_index_components(index_code):
     def _try_csindex():
         return ak.index_stock_cons_csindex(symbol=index_code)
     try:
-        df = _fetch_with_timeout(_try_csindex, timeout=8)
+        df = _fetch_with_timeout(_try_csindex, timeout=12)
         if df is not None and not df.empty:
             df = df.rename(columns={"成分券代码": "code", "成分券名称": "name"})
-            df["code"] = df["code"].astype(str).str.zfill(6)
-            result = df[["code", "name"]].copy()
-            try:
-                result.to_csv(cache_file, index=False)
-            except Exception:
-                pass
-            return result, None
+            if "code" in df.columns and "name" in df.columns:
+                df["code"] = df["code"].astype(str).str.zfill(6)
+                result = df[["code", "name"]].copy()
+                ok, why = _is_valid_components(result, index_code)
+                if ok:
+                    try:
+                        result.to_csv(cache_file, index=False)
+                    except Exception:
+                        pass
+                    return result, None
+                else:
+                    last_err = f"中证官网数据异常（{why}）"
+            else:
+                last_err = "中证官网返回缺列"
         else:
             last_err = "中证官网超时"
     except Exception as e:
         last_err = f"中证官网: {str(e)[:60]}"
 
-    # ---------- 源2：新浪（超时8秒） ----------
-    def _try_sina():
-        return ak.index_stock_cons(symbol=index_code)
-    try:
-        df = _fetch_with_timeout(_try_sina, timeout=8)
-        if df is not None and not df.empty:
-            rename_map = {}
-            for c in df.columns:
-                cs = str(c)
-                if "代码" in cs: rename_map[c] = "code"
-                if "名称" in cs: rename_map[c] = "name"
-            df = df.rename(columns=rename_map)
-            if "code" in df.columns and "name" in df.columns:
-                df["code"] = df["code"].astype(str).str.zfill(6)
-                result = df[["code", "name"]].copy()
-                try:
-                    result.to_csv(cache_file, index=False)
-                except Exception:
-                    pass
-                return result, None
-        else:
-            last_err += " | 新浪超时"
-    except Exception as e:
-        last_err += f" | 新浪: {str(e)[:60]}"
+    # ---------- 源2：新浪（超时12秒；新指数直接跳过） ----------
+    if index_code not in SINA_UNSUPPORTED:
+        def _try_sina():
+            return ak.index_stock_cons(symbol=index_code)
+        try:
+            df = _fetch_with_timeout(_try_sina, timeout=12)
+            if df is not None and not df.empty:
+                rename_map = {}
+                for c in df.columns:
+                    cs = str(c)
+                    if "代码" in cs: rename_map[c] = "code"
+                    if "名称" in cs: rename_map[c] = "name"
+                df = df.rename(columns=rename_map)
+                if "code" in df.columns and "name" in df.columns:
+                    df["code"] = df["code"].astype(str).str.zfill(6)
+                    result = df[["code", "name"]].copy()
+                    ok, why = _is_valid_components(result, index_code)
+                    if ok:
+                        try:
+                            result.to_csv(cache_file, index=False)
+                        except Exception:
+                            pass
+                        return result, None
+                    else:
+                        last_err += f" | 新浪数据异常（{why}）"
+                else:
+                    last_err += " | 新浪返回缺列"
+            else:
+                last_err += " | 新浪超时"
+        except Exception as e:
+            last_err += f" | 新浪: {str(e)[:60]}"
+    else:
+        # 【补丁A】对新浪不收录的指数（A50/A100/A500），直接跳过，避免脏数据
+        last_err += " | 新浪（已跳过：该指数不在新浪收录范围）"
 
-    # ---------- 兜底：本地有旧文件就用 ----------
+    # ---------- 兜底：本地有旧文件就用（校验通过才用） ----------
     if os.path.exists(cache_file):
         try:
             df = pd.read_csv(cache_file, dtype={"code": str})
-            if not df.empty and "code" in df.columns and "name" in df.columns:
+            if "code" in df.columns and "name" in df.columns:
                 df["code"] = df["code"].astype(str).str.zfill(6)
-                return df[["code", "name"]].copy(), None
+                result = df[["code", "name"]].copy()
+                ok, why = _is_valid_components(result, index_code)
+                if ok:
+                    return result, None
         except Exception:
             pass
 
@@ -428,12 +492,13 @@ def fetch_kline_from_network(stock_code, days=200):
     except Exception as e:
         last_err += f" | 新浪: {str(e)[:50]}"
     return None, last_err
+
+
 # ============================================================
-# 【新增】交易日历 & 除权检测辅助函数
+# 交易日历 & 除权检测辅助函数
 # ============================================================
 @st.cache_data(ttl=86400, show_spinner=False)
 def _get_trade_dates():
-    """获取A股交易日历（用于判断缓存是否已是最新交易日）"""
     try:
         df = ak.tool_trade_date_hist_sina()
         return set(pd.to_datetime(df["trade_date"]).dt.normalize())
@@ -442,17 +507,11 @@ def _get_trade_dates():
 
 
 def _check_seam_jump(old_df, new_df, tolerance=0.02):
-    """
-    检查新旧数据接缝处是否出现价格跳变（说明发生了除权）。
-    old_df: 本地缓存    new_df: 新拉取的数据
-    tolerance: 允许的最大相对差（默认2%）
-    返回 True 表示检测到跳变，需要全量重拉
-    """
     try:
         old_dates = set(old_df["date"])
         overlap = new_df[new_df["date"].isin(old_dates)]
         if overlap.empty or len(overlap) < 2:
-            return False  # 没有重叠，无法判断
+            return False
         merged = pd.merge(
             overlap[["date", "close"]],
             old_df[["date", "close"]],
@@ -465,15 +524,8 @@ def _check_seam_jump(old_df, new_df, tolerance=0.02):
     except Exception:
         return False
 
+
 def load_or_update_kline(stock_code, days=200):
-    """
-    加载K线：本地缓存优先，只补拉缺失的近期数据。
-    改进点：
-      1. 用交易日历判断缓存是否已是最新交易日（不再用自然日）
-      2. 检测新旧数据接缝处价格跳变（前复权除权）→ 触发全量重拉
-      3. 缺口过大（>120天）→ 直接全量重拉，避免中间断层
-      4. 原子写入，避免缓存损坏
-    """
     file_path = os.path.join(DATA_DIR, f"{stock_code}.parquet")
     today = pd.Timestamp.today().normalize()
 
@@ -490,7 +542,6 @@ def load_or_update_kline(stock_code, days=200):
         except Exception:
             pass
 
-    # ---------- 本地已有缓存 ----------
     if os.path.exists(file_path):
         try:
             local_df = pd.read_parquet(file_path)
@@ -499,15 +550,12 @@ def load_or_update_kline(stock_code, days=200):
 
             if not local_df.empty:
                 last_cached = local_df["date"].max().normalize()
-
-                # 用交易日历判断是否需要更新
                 trade_dates = _get_trade_dates()
                 if trade_dates is not None:
                     past_td = [d for d in trade_dates if d <= today]
                     latest_td = max(past_td) if past_td else today
                     need_update = last_cached < latest_td
                 else:
-                    # 兜底：拿不到日历时，自然日超过 3 天才更新
                     need_update = (today - last_cached).days > 3
 
                 if not need_update:
@@ -515,7 +563,6 @@ def load_or_update_kline(stock_code, days=200):
 
                 gap_days = (today - last_cached).days
 
-                # 缺口过大 → 全量重拉（避免中间断层）
                 if gap_days > 120:
                     df, err = fetch_kline_from_network(stock_code, days=days)
                     if df is not None and not df.empty:
@@ -524,12 +571,10 @@ def load_or_update_kline(stock_code, days=200):
                         return df, None
                     return _tail(local_df), None
 
-                # 缺口较小 → 只补最近一段
                 fetch_days = max(60, gap_days + 30)
                 new_df, err = fetch_kline_from_network(stock_code, days=fetch_days)
 
                 if new_df is not None and not new_df.empty:
-                    # 检测除权跳变（前复权历史值被重算）
                     if _check_seam_jump(local_df, new_df):
                         df, err2 = fetch_kline_from_network(stock_code, days=days)
                         if df is not None and not df.empty:
@@ -538,7 +583,6 @@ def load_or_update_kline(stock_code, days=200):
                             return df, None
                         return _tail(local_df), None
 
-                    # 合并新旧数据
                     combined = pd.concat([local_df, new_df], ignore_index=True)
                     combined = combined.drop_duplicates(subset=["date"], keep="last")
                     combined = combined.sort_values("date").reset_index(drop=True)
@@ -546,54 +590,146 @@ def load_or_update_kline(stock_code, days=200):
                     _save(combined)
                     return combined, None
                 else:
-                    # 补拉失败，用旧缓存兜底
                     return _tail(local_df), None
         except Exception:
-            pass  # 缓存读失败，走下面全量拉取
+            pass
 
-    # ---------- 本地无缓存，全量拉取 ----------
     df, err = fetch_kline_from_network(stock_code, days=days)
     if df is not None and not df.empty:
         df = _tail(df)
         _save(df)
     return df, err
 
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_realtime_valuation_map():
+    """
+    【备用数据源】东方财富实时行情，一次拉取覆盖全市场。
+    比乐咕乐股稳定得多，用来兜底 PE / PB / 总市值。
+    返回：{code: {"PE": float|None, "PB": float|None, "总市值(亿)": float|None}}
+    """
+    try:
+        df = ak.stock_zh_a_spot_em()
+        if df is None or df.empty:
+            return {}
+        keep_cols = ["代码", "市盈率-动态", "市净率", "总市值"]
+        cols = [c for c in keep_cols if c in df.columns]
+        df = df[cols].copy()
+        df["代码"] = df["代码"].astype(str).str.zfill(6)
+
+        result = {}
+        for _, row in df.iterrows():
+            code = row["代码"]
+            pe = _safe_float(row.get("市盈率-动态"))
+            pb = _safe_float(row.get("市净率"))
+            mv = _safe_float(row.get("总市值"))
+            result[code] = {
+                "PE": pe,
+                "PB": pb,
+                "总市值(亿)": round(mv / 1e8, 2) if mv is not None else None,
+            }
+        return result
+    except Exception:
+        return {}
+
 
 # ============================================================
 # 基本面
 # ============================================================
-@st.cache_data(ttl=86400, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)   # ← TTL 从 86400 改成 3600
 def get_fundamental_data(stock_code):
-    result = {"PE": None, "PB": None, "总市值(亿)": None,
-              "ROE(%)": None, "净利润增速(%)": None, "营收增速(%)": None}
-    try:
-        df = ak.stock_a_indicator_lg(symbol=stock_code)
-        if df is not None and not df.empty:
-            latest = df.iloc[-1]
-            result["PE"] = _safe_float(latest.get("pe_ttm"))
-            result["PB"] = _safe_float(latest.get("pb"))
-            mv = _safe_float(latest.get("total_mv"))
-            if mv is not None:
-                result["总市值(亿)"] = round(mv / 1e8, 2)
-    except Exception:
-        pass
-    try:
-        df = ak.stock_financial_analysis_indicator(symbol=stock_code, start_year="2022")
-        if df is not None and not df.empty:
-            latest = df.iloc[0]
-            for col in df.columns:
-                cs = str(col)
-                if "净资产收益率" in cs and "摊薄" not in cs and result["ROE(%)"] is None:
-                    result["ROE(%)"] = _safe_float(latest[col])
-                if "净利润增长率" in cs and result["净利润增速(%)"] is None:
-                    result["净利润增速(%)"] = _safe_float(latest[col])
-                if ("主营业务收入增长率" in cs or "营业收入增长率" in cs) and result["营收增速(%)"] is None:
-                    result["营收增速(%)"] = _safe_float(latest[col])
-    except Exception:
-        pass
+    """
+    【修复1】每个接口带重试；返回结构中加入 "has_pe" / "has_roe" 等标记，
+    方便调用方区分"真的没数据"和"值为None"。
+    """
+    result = {
+        "PE": None, "PB": None, "总市值(亿)": None,
+        "ROE(%)": None, "净利润增速(%)": None, "营收增速(%)": None,
+        "_pe_ok": False, "_roe_ok": False, "_mv_ok": False,
+        "_profit_ok": False, "_rev_ok": False,
+    }
+
+    # ------ PE / PB / 市值 ------
+    for attempt in range(3):
+        try:
+            df = ak.stock_a_indicator_lg(symbol=stock_code)
+            if df is not None and not df.empty:
+                latest = df.iloc[-1]
+                pe = _safe_float(latest.get("pe_ttm"))
+                pb = _safe_float(latest.get("pb"))
+                mv = _safe_float(latest.get("total_mv"))
+                if pe is not None:
+                    result["PE"] = pe
+                    result["_pe_ok"] = True
+                if pb is not None:
+                    result["PB"] = pb
+                if mv is not None:
+                    result["总市值(亿)"] = round(mv / 1e8, 2)
+                    result["_mv_ok"] = True
+                break
+        except Exception:
+            time.sleep(1)
+
+    # ------ ROE / 增速 ------
+    for attempt in range(3):
+        try:
+            df = ak.stock_financial_analysis_indicator(symbol=stock_code, start_year="2022")
+            if df is not None and not df.empty:
+                latest = df.iloc[0]
+                for col in df.columns:
+                    cs = str(col)
+                    if "净资产收益率" in cs and "摊薄" not in cs and result["ROE(%)"] is None:
+                        v = _safe_float(latest[col])
+                        if v is not None:
+                            result["ROE(%)"] = v
+                            result["_roe_ok"] = True
+                    if "净利润增长率" in cs and result["净利润增速(%)"] is None:
+                        v = _safe_float(latest[col])
+                        if v is not None:
+                            result["净利润增速(%)"] = v
+                            result["_profit_ok"] = True
+                    if ("主营业务收入增长率" in cs or "营业收入增长率" in cs) and result["营收增速(%)"] is None:
+                        v = _safe_float(latest[col])
+                        if v is not None:
+                            result["营收增速(%)"] = v
+                            result["_rev_ok"] = True
+                break
+        except Exception:
+            time.sleep(1)
+
     return result
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_earnings_forecast(period_date):
+    """
+    获取指定报告期的全市场业绩预告。
+    period_date: 报告期季末日期，格式 YYYYMMDD，如 '20260930' 表示三季报
+    返回：DataFrame，包含代码、名称、预告类型、净利润变动幅度等
+    """
+    try:
+        df = ak.stock_yjyg_em(date=period_date)
+        if df is None or df.empty:
+            return None, f"未获取到 {period_date} 的业绩预告数据（可能该报告期尚未开始披露）"
+        # 统一代码格式
+        code_col = None
+        for c in df.columns:
+            if "代码" in str(c):
+                code_col = c; break
+        if code_col:
+            df["代码"] = df[code_col].astype(str).str.zfill(6)
+        return df, None
+    except Exception as e:
+        return None, f"获取业绩预告失败：{e}"
 
+
+def filter_forecast_by_components(forecast_df, component_df):
+    """
+    将业绩预告数据按成分股列表过滤。
+    forecast_df: get_earnings_forecast 返回的全市场预告数据
+    component_df: 指数成分股 DataFrame（含 code / name 列）
+    """
+    comp_codes = set(component_df["code"].astype(str).str.zfill(6))
+    result = forecast_df[forecast_df["代码"].isin(comp_codes)].copy()
+    return result
 # ============================================================
 # 辅助
 # ============================================================
@@ -625,24 +761,15 @@ def to_weekly(kline_df):
                                         "close": "last", "volume": "sum"}).dropna()
     return weekly.reset_index()
 
-# ============================================================
-# 【新增】通达信标准 KDJ 计算（与同花顺、通达信一致）
-# ============================================================
+
 def calc_kdj(df, n=9, m1=3, m2=3):
-    """
-    RSV = (CLOSE - LLV(LOW, N)) / (HHV(HIGH, N) - LLV(LOW, N)) * 100
-    K   = SMA(RSV, M1, 1)
-    D   = SMA(K,   M2, 1)
-    J   = 3*K - 2*D
-    说明：通达信 SMA(X, N, 1) 等价于 pandas 的 ewm(alpha=1/N, adjust=False)
-    """
     out = df.copy()
     low_n  = out["low"].rolling(window=n, min_periods=1).min()
     high_n = out["high"].rolling(window=n, min_periods=1).max()
 
     denom = high_n - low_n
     rsv = (out["close"] - low_n) / denom.replace(0, np.nan) * 100
-    rsv = rsv.fillna(50)  # 一字板/停牌等分母为0时，用中性值50
+    rsv = rsv.fillna(50)
 
     k = rsv.ewm(alpha=1 / m1, adjust=False).mean()
     d = k.ewm(alpha=1 / m2, adjust=False).mean()
@@ -651,16 +778,15 @@ def calc_kdj(df, n=9, m1=3, m2=3):
     out["kdjk"] = k
     out["kdjd"] = d
     out["kdjj"] = j
-    # 手工算金叉/死叉（stockstats 的 kdjk_xu_kdjd 我们不打算再用了）
     out["kdjk_xu_kdjd"] = (out["kdjk"] > out["kdjd"]) & (out["kdjk"].shift(1) <= out["kdjd"].shift(1))
     out["kdjd_xu_kdjk"] = (out["kdjd"] > out["kdjk"]) & (out["kdjd"].shift(1) <= out["kdjk"].shift(1))
     return out
+
+
 def to_monthly(kline_df):
-    """日K聚合为月K（月末）"""
     df = kline_df.copy()
     df["date"] = pd.to_datetime(df["date"])
     df = df.set_index("date")
-    # pandas 2.0+ 用 "ME"，旧版本用 "M"，这里做兼容
     try:
         monthly = df.resample("ME").agg({"open": "first", "high": "max", "low": "min",
                                           "close": "last", "volume": "sum"}).dropna()
@@ -705,7 +831,6 @@ def check_stock(kline_df, conds):
     try:
         df = wrap(kline_df.copy())
         df.get("boll"); df.get("macd"); df.get("atr")
-        # 用通达信标准算法覆盖 stockstats 的 KDJ
         kdj_df = calc_kdj(kline_df)
         df["kdjk"] = kdj_df["kdjk"].values
         df["kdjd"] = kdj_df["kdjd"].values
@@ -722,20 +847,18 @@ def check_stock(kline_df, conds):
         "涨跌幅(%)": round((df["close"].iloc[-1] / df["close"].iloc[-2] - 1) * 100, 2),
     }
 
-    # 1. 均线金叉
     c = conds.get("ma_golden", {})
     if c.get("enabled"):
         enabled_count += 1
         fast, slow = int(c["fast"]), int(c["slow"])
         try:
             col_name = f"close_{fast}_sma_xu_close_{slow}_sma"
-            _ = df[col_name]  # 显式赋值给 _ ，明确表示"只用一次，不显示"
+            _ = df[col_name]
             if df[col_name].iloc[-1]:
                 hits.append(f"MA金叉({fast}↑{slow})")
         except Exception:
             pass
 
-    # 2. 均线多头
     c = conds.get("ma_bull", {})
     if c.get("enabled"):
         enabled_count += 1
@@ -747,7 +870,6 @@ def check_stock(kline_df, conds):
         except Exception:
             pass
 
-    # 3. 价格vs均线
     c = conds.get("price_vs_ma", {})
     if c.get("enabled"):
         enabled_count += 1
@@ -761,7 +883,6 @@ def check_stock(kline_df, conds):
         except Exception:
             pass
 
-    # 4. 偏离均线
     c = conds.get("ma_deviation", {})
     if c.get("enabled"):
         enabled_count += 1
@@ -777,7 +898,6 @@ def check_stock(kline_df, conds):
         except Exception:
             pass
 
-    # 5. MACD金叉/死叉
     c = conds.get("macd_cross", {})
     if c.get("enabled"):
         enabled_count += 1
@@ -789,7 +909,6 @@ def check_stock(kline_df, conds):
         except Exception:
             pass
 
-    # 6. MACD柱反转
     c = conds.get("macd_hist", {})
     if c.get("enabled"):
         enabled_count += 1
@@ -802,7 +921,6 @@ def check_stock(kline_df, conds):
         except Exception:
             pass
 
-    # 7. BOLL
     c = conds.get("boll", {})
     if c.get("enabled"):
         enabled_count += 1
@@ -816,7 +934,6 @@ def check_stock(kline_df, conds):
         except Exception:
             pass
 
-    # 8. 日线KDJ数值
     c = conds.get("kdj_daily", {})
     for key, col in [("K", "kdjk"), ("D", "kdjd"), ("J", "kdjj")]:
         sub = c.get(key, {})
@@ -826,12 +943,11 @@ def check_stock(kline_df, conds):
                 v = df[col].iloc[-1]
                 ok = (v > sub["value"]) if sub["op"] == ">" else (v < sub["value"])
                 if ok:
-                   hits.append(f"日{key}{sub['op']}{sub['value']}(={v:.1f})")
+                    hits.append(f"日{key}{sub['op']}{sub['value']}(={v:.1f})")
                 snapshot[f"日{key}"] = round(v, 2)
             except Exception:
                 pass
 
-    # 9. KDJ金叉/死叉
     c = conds.get("kdj_cross", {})
     if c.get("enabled"):
         enabled_count += 1
@@ -843,7 +959,6 @@ def check_stock(kline_df, conds):
         except Exception:
             pass
 
-    # 10. 周线KDJ
     c = conds.get("kdj_weekly", {})
     if any(c.get(k, {}).get("enabled") for k in ["K", "D", "J"]):
         try:
@@ -862,7 +977,6 @@ def check_stock(kline_df, conds):
         except Exception:
             pass
 
-    # 11. 月线KDJ（新增）
     c = conds.get("kdj_monthly", {})
     if any(c.get(k, {}).get("enabled") for k in ["K", "D", "J"]):
         try:
@@ -881,7 +995,6 @@ def check_stock(kline_df, conds):
         except Exception:
             pass
 
-    # 12. RSI
     c = conds.get("rsi", {})
     if c.get("enabled"):
         enabled_count += 1
@@ -896,7 +1009,6 @@ def check_stock(kline_df, conds):
         except Exception:
             pass
 
-    # 13. 成交量放大
     c = conds.get("volume", {})
     if c.get("enabled"):
         enabled_count += 1
@@ -909,7 +1021,6 @@ def check_stock(kline_df, conds):
         except Exception:
             pass
 
-    # 14. 量价配合
     c = conds.get("vol_price", {})
     if c.get("enabled"):
         enabled_count += 1
@@ -925,7 +1036,6 @@ def check_stock(kline_df, conds):
         except Exception:
             pass
 
-    # 15. 突破N日新高
     c = conds.get("break_high", {})
     if c.get("enabled"):
         enabled_count += 1
@@ -938,7 +1048,6 @@ def check_stock(kline_df, conds):
         except Exception:
             pass
 
-    # 16. 跌破N日新低
     c = conds.get("break_low", {})
     if c.get("enabled"):
         enabled_count += 1
@@ -951,7 +1060,6 @@ def check_stock(kline_df, conds):
         except Exception:
             pass
 
-    # 17. ATR
     c = conds.get("atr", {})
     if c.get("enabled"):
         enabled_count += 1
@@ -966,7 +1074,7 @@ def check_stock(kline_df, conds):
             snapshot["ATR%"] = round(atr_pct, 2)
         except Exception:
             pass
-    # 18. 连续涨跌天数
+
     c = conds.get("streak", {})
     if c.get("enabled"):
         enabled_count += 1
@@ -990,7 +1098,6 @@ def check_stock(kline_df, conds):
             snapshot["连续天数"] = streak if direction == "up" else -streak
         except Exception:
             pass
-
 
     return hits, enabled_count, snapshot
 
@@ -1021,19 +1128,16 @@ def export_to_excel(df):
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="筛选结果")
         ws = writer.sheets["筛选结果"]
-        # 列宽
         for i, col in enumerate(df.columns, 1):
             letter = chr(64 + i) if i <= 26 else "A" + chr(64 + i - 26)
             max_len = max(df[col].astype(str).map(len).max() if len(df) > 0 else 0, len(str(col))) + 2
             ws.column_dimensions[letter].width = min(max(max_len, 8), 35)
-        # 涨跌幅颜色
         if "涨跌幅(%)" in df.columns:
             col_idx = list(df.columns).index("涨跌幅(%)") + 1
             for row in range(2, len(df) + 2):
                 cell = ws.cell(row=row, column=col_idx)
                 if isinstance(cell.value, (int, float)):
                     cell.font = Font(color="C00000" if cell.value > 0 else "008000")
-        # 表头
         for i in range(1, len(df.columns) + 1):
             cell = ws.cell(row=1, column=i)
             cell.font = Font(bold=True)
@@ -1055,91 +1159,56 @@ st.title("📈 股票指标筛选工具")
 INDEX_CODE_MAP = {"沪深300": "000300", "中证A50": "930050",
                   "中证A100": "000903", "中证A500": "000510"}
 
-# 应用预设（必须在 widget 定义之前）
 if "apply_preset" in st.session_state:
     preset = st.session_state.pop("apply_preset")
     for k, v in preset.items():
         st.session_state[k] = v
 
 with st.sidebar:
-    # ========================================================
-    # 参数说明
-    # ========================================================
     with st.expander("📖 参数说明（强烈建议先看一遍）", expanded=False):
         st.markdown("""
 ### 🎯 通用参数
-- **股票池**：从哪个指数选股。沪深300大盘蓝筹、中证A50核心资产、中证A100行业龙头核心资产、中证A500中盘成长。**股票池越大，筛选时间越长**。
+- **股票池**：从哪个指数选股。**股票池越大，筛选时间越长**。
 - **历史K线天数**：拉取多少天的日线。**越大越准，但越慢**。
   - 日线KDJ：≥80 天足够
   - 周线KDJ：≥150 天
   - **月线KDJ：≥250 天**（推荐值）
 - **条件逻辑**：
-  - **AND（同时满足）**：条件都要满足，结果少而精，适合严格筛选。
-  - **OR（满足任意一个）**：任一条件满足即可，结果多，适合先广撒网。
+  - **AND（同时满足）**：条件都要满足，结果少而精。
+  - **OR（满足任意一个）**：任一条件满足即可，结果多。
 
 ### 📊 均线类
-- **均线金叉**：短期均线上穿长期均线（如 MA5 上穿 MA20），典型买入信号。
-  - 快线周期：短的那条，通常 5 或 10。
-  - 慢线周期：长的那条，通常 20、30 或 60。
-- **均线多头排列**：MA5 > MA10 > MA20，趋势向上的强势形态。
-- **价格/均线关系**：价格在均线上方=强势，下方=弱势。
-- **偏离均线幅度**：`(现价 - 均线)/均线 × 100%`。如"偏离20日均线>10%"表示短期涨得太急，有回调风险。
+- **均线金叉**：短期均线上穿长期均线。
+- **均线多头排列**：MA5 > MA10 > MA20。
+- **价格/均线关系**：价格在均线上方=强势。
+- **偏离均线幅度**：`(现价 - 均线)/均线 × 100%`。
 
 ### 📉 MACD
-- **金叉/死叉**：DIF 上穿 DEA 为金叉（看涨），下穿为死叉（看跌）。
-- **柱状线反转**：MACD 柱由负转正（动能转多）或由正转负（动能转空），比金叉更早发生。
+- **金叉/死叉**：DIF 上穿 DEA 为金叉。
+- **柱状线反转**：MACD 柱由负转正。
 
 ### 🎯 BOLL 布林带
-由中轨（20日均线）+ 上下轨（±2倍标准差）组成：
-- **突破上轨**：强势突破，可能加速
-- **跌破下轨**：弱势破位，可能继续下跌
-- **在中轨上方/下方**：多头/空头区域判断
+由中轨（20日均线）+ 上下轨（±2倍标准差）组成。
 
 ### 🔱 KDJ（三种周期）
-- **数值筛选**：K、D 的经典阈值
-  - **K < 20**：超卖区（可能是买点）
-  - **D < 20**：确认超卖
-  - **J < 0**：极端超卖
-  - **K > 80**：超买区（可能是卖点）
-- **金叉/死叉**：K 上穿 D 是金叉（买入），K 下穿 D 是死叉（卖出）
-- **日线/周线/月线**：
-  - **日线**反映短期情绪，变化快
-  - **周线**反映中期趋势，更可靠
-  - **月线**反映长期方向，信号最强但触发很少
-  - **共振**：如"周K<20 + 日线金叉"= 中期超卖+短期启动，是经典强信号
+- **K < 20**：超卖区；**K > 80**：超买区
+- **金叉/死叉**：K 上穿 D 是金叉。
+- **共振**：周K<20 + 日线金叉 = 经典强信号。
 
 ### 🌡️ RSI 相对强弱
-范围 0~100：
-- **RSI < 30**：超卖，可能反弹
-- **RSI > 70**：超买，可能回调
-- 常用周期：6（敏感）、12、14（稳健）
+- **RSI < 30**：超卖；**RSI > 70**：超买。
 
 ### 📦 成交量 / 形态 / ATR
-- **放量倍数**：`今日量 / 5日均量`。1.5倍=温和放量，3倍以上=异动。
-- **量增价升**：量能放大 + 价格上涨，健康上涨。
-- **量缩价跌**：量能萎缩 + 价格下跌，缩量调整。
-- **ATR%**：`ATR / 收盘价 × 100%`，代表日均波动幅度。3% 以上=活跃股，1% 以下=低波动股。
-- **突破N日新高**：收盘价 > 过去N日最高。突破越长期的高点，信号越强。
-- **跌破N日新低**：收盘价 < 过去N日最低。配合低位 KDJ 是超跌抄底信号。
+- **放量倍数**：`今日量 / 5日均量`。
+- **ATR%**：日均波动幅度。
 
 ### 💰 基本面
-- **PE(TTM)**：市盈率，越低越便宜。0~30 是低估值区间，>100 需警惕。
-- **PB**：市净率，< 3 比较健康。
-- **ROE**：净资产收益率，> 15% 说明公司赚钱能力强。
-- **总市值**：过滤掉太小的公司（如 < 100亿），避免流动性和退市风险。
-- **净利润/营收增速**：> 0 表示同比增长，> 20% 表示高成长。
-
-### ⚡ 性能设置
-- **并发拉取**：多线程同时拉数据，快 3~5 倍，但**容易被限流**。默认关闭。
-- **建议**：日常串行（稳），偶尔赶时间开 3 线程。
+- **PE(TTM)**：0~30 是低估值区间。
+- **ROE**：> 15% 说明赚钱能力强。
+- **缺失数据会被直接过滤掉**（不会自动放行）。
 
 ### 🏆 综合评分
-每只命中的股票自动打分：
-- 均线金叉 +30，MACD金叉 +25，KDJ金叉 +25
-- 周线KDJ低位 +20，月线KDJ低位 +25
-- 突破新高 +20，放量 +15
-- 低PE(<30) +10，高ROE(>15) +15
-- **分数越高，信号越强**。结果自动按分数从高到低排序。
+每只命中的股票自动打分，分数越高信号越强。
         """)
 
     st.header("⚙️ 设置")
@@ -1147,7 +1216,6 @@ with st.sidebar:
     history_days = st.slider("历史K线天数", 80, 600, 400, 10, key="sld_days")
     logic_mode = st.radio("条件逻辑", ["同时满足全部 (AND)", "满足任意一个 (OR)"], index=0, key="rd_logic")
 
-    # ---------- 预设策略 ----------
     with st.expander("🎯 预设策略模板", expanded=False):
         st.caption("点击一键应用常用组合，再按需微调")
         for preset_name in PRESET_STRATEGIES.keys():
@@ -1155,7 +1223,6 @@ with st.sidebar:
                 st.session_state["apply_preset"] = PRESET_STRATEGIES[preset_name]
                 st.rerun()
 
-    # ---------- 自选股 ----------
     with st.expander("⭐ 自选股 / 关注列表", expanded=False):
         wl = load_watchlist()
         st.caption(f"当前自选 {len(wl)} 只")
@@ -1178,12 +1245,10 @@ with st.sidebar:
             with st.expander(f"查看自选列表（{len(wl)}）", expanded=False):
                 st.write("、".join(wl))
 
-    # ---------- 性能 ----------
     with st.expander("⚡ 性能设置", expanded=False):
         use_concurrent = st.checkbox("启用并发拉取（更快，但可能被限流）", value=False, key="perf_concurrent")
         num_workers = st.slider("并发线程数", 2, 5, 3, 1, key="perf_workers", disabled=not use_concurrent)
 
-    # ---------- 数据管理 ----------
     with st.expander("🗄️ 数据管理", expanded=False):
         skip_st = st.checkbox("自动过滤 ST / 停牌 / 新股", value=True, key="chk_skip")
         col_a, col_b = st.columns(2)
@@ -1193,18 +1258,29 @@ with st.sidebar:
                     files = [f for f in os.listdir(DATA_DIR) if f.endswith(".parquet")]
                     st.session_state["cache_count"] = len(files)
         with col_b:
-            if st.button("🗑️ 清空缓存", key="btn_clear_cache"):
+            if st.button("🗑️ 清空K线缓存", key="btn_clear_cache"):
                 if os.path.exists(DATA_DIR):
                     shutil.rmtree(DATA_DIR); os.makedirs(DATA_DIR, exist_ok=True)
-                    st.session_state["cache_msg"] = "缓存已清空"
+                    st.session_state["cache_msg"] = "K线缓存已清空"
         if "cache_count" in st.session_state:
             st.info(f"本地已缓存 {st.session_state['cache_count']} 只")
         if "cache_msg" in st.session_state:
             st.success(st.session_state["cache_msg"])
+        # 【修复2】成分股缓存单独清理入口
+        if st.button("🧹 清空成分股缓存（出现股票池异常时点此）", key="btn_clear_components"):
+            removed = 0
+            for f in os.listdir("data"):
+                if f.startswith("components_") and f.endswith(".csv"):
+                    try:
+                        os.remove(os.path.join("data", f))
+                        removed += 1
+                    except Exception:
+                        pass
+            st.success(f"已清空 {removed} 个成分股缓存，请重新筛选。")
 
-    # ---------- 基本面 ----------
     with st.expander("💰 基本面筛选", expanded=False):
         fund_on = st.checkbox("启用基本面筛选", value=False, key="fund_on")
+        st.caption("⚠️ 勾选的条件下，若某股票该指标无数据，将被直接过滤掉（不再放行）")
         pe_on = st.checkbox("PE(TTM) 区间", value=False, key="pe_on", disabled=not fund_on)
         pc1, pc2 = st.columns(2)
         with pc1:
@@ -1226,7 +1302,6 @@ with st.sidebar:
         rev_on = st.checkbox("营收增速 下限", value=False, key="rev_on", disabled=not fund_on)
         rev_min = st.number_input("营收增速 ≥ (%)", -100.0, 500.0, 0.0, 5.0, key="rev_min", disabled=not (fund_on and rev_on))
 
-    # ---------- 均线 ----------
     with st.expander("📊 均线类", expanded=False):
         ma_golden_on = st.checkbox("启用均线金叉", value=False, key="ui_ma_g_on")
         c1, c2 = st.columns(2)
@@ -1246,19 +1321,16 @@ with st.sidebar:
         with dc2:
             dev_val = st.number_input("偏离%##dev", -50.0, 50.0, 5.0, 0.5, key="ui_dev_val", disabled=not dev_on)
 
-    # ---------- MACD ----------
     with st.expander("📉 MACD", expanded=False):
         macd_on = st.checkbox("MACD 金叉/死叉", value=False, key="ui_macd_on")
         macd_mode = st.radio("形态", ["金叉 (DIF上穿DEA)", "死叉 (DEA上穿DIF)"], horizontal=True, key="ui_macd_mode", disabled=not macd_on)
         macdh_on = st.checkbox("MACD 柱状线反转", value=False, key="ui_macdh_on")
         macdh_mode = st.radio("方向", ["由负转正", "由正转负"], horizontal=True, key="ui_macdh_mode", disabled=not macdh_on)
 
-    # ---------- BOLL ----------
     with st.expander("🎯 布林带 BOLL", expanded=False):
         boll_on = st.checkbox("启用 BOLL", value=False, key="ui_boll_on")
         boll_mode = st.selectbox("BOLL形态", ["突破上轨", "跌破下轨", "在中轨上方", "在中轨下方"], key="ui_boll_mode", disabled=not boll_on)
 
-    # ---------- 日线 KDJ ----------
     with st.expander("🔱 日线 KDJ", expanded=False):
         dk_on = st.checkbox("日线 KDJ 数值筛选", value=False, key="ui_dkdj_on")
         dk_k_on = st.checkbox("K 值", value=False, key="ui_dk_k_on", disabled=not dk_on)
@@ -1282,7 +1354,6 @@ with st.sidebar:
         kdj_cross_on = st.checkbox("KDJ 金叉/死叉", value=False, key="ui_kdj_cross_on")
         kdj_cross_mode = st.radio("形态##kdjc", ["金叉 (K上穿D)", "死叉 (D上穿K)"], horizontal=True, key="ui_kdj_cross_mode", disabled=not kdj_cross_on)
 
-    # ---------- 周线 KDJ ----------
     with st.expander("🔱 周线 KDJ", expanded=False):
         wk_on = st.checkbox("周线 KDJ 数值筛选", value=False, key="ui_wkdj_on")
         wk_k_on = st.checkbox("周K值", value=False, key="ui_wk_k_on", disabled=not wk_on)
@@ -1304,7 +1375,6 @@ with st.sidebar:
         with wjc2:
             wk_j_v = st.number_input("周J阈值", -100.0, 200.0, 0.0, 1.0, key="ui_wk_j_v", disabled=not wk_j_on)
 
-    # ---------- 月线 KDJ（新增）----------
     with st.expander("🔱 月线 KDJ", expanded=False):
         st.caption("月K数据需≥6个月，建议历史K线天数≥250")
         mk_on = st.checkbox("月线 KDJ 数值筛选", value=False, key="ui_mkdj_on")
@@ -1327,7 +1397,6 @@ with st.sidebar:
         with mjc2:
             mk_j_v = st.number_input("月J阈值", -100.0, 200.0, 20.0, 1.0, key="ui_mk_j_v", disabled=not mk_j_on)
 
-    # ---------- RSI ----------
     with st.expander("🌡️ RSI", expanded=False):
         rsi_on = st.checkbox("启用 RSI", value=False, key="ui_rsi_on")
         rc1, rc2, rc3 = st.columns(3)
@@ -1338,7 +1407,6 @@ with st.sidebar:
         with rc3:
             rsi_val = st.number_input("阈值##rsi", 0.0, 100.0, 30.0, 1.0, key="ui_rsi_val", disabled=not rsi_on)
 
-    # ---------- 成交量 / 形态 / ATR ----------
     with st.expander("📦 成交量 / 形态 / ATR", expanded=False):
         vol_on = st.checkbox("成交量放大", value=False, key="ui_vol_on")
         vol_mult = st.number_input("放量倍数", 1.0, 10.0, 1.5, 0.1, key="ui_vol_mult", disabled=not vol_on)
@@ -1354,8 +1422,7 @@ with st.sidebar:
         bh_n = st.number_input("N 日##bh", 5, 250, 60, 5, key="ui_bh_n", disabled=not bh_on)
         bl_on = st.checkbox("跌破 N 日新低", value=False, key="ui_bl_on")
         bl_n = st.number_input("N 日##bl", 5, 250, 60, 5, key="ui_bl_n", disabled=not bl_on)
-        
-        # 连续涨跌
+
         streak_on = st.checkbox("连续涨/跌天数", value=False, key="ui_streak_on")
         streak_direction = st.radio("方向##streak", ["连续上涨", "连续下跌"],
                                     horizontal=True, key="ui_streak_dir",
@@ -1367,68 +1434,6 @@ with st.sidebar:
         with sc2:
             streak_days = st.number_input("天数##streak", 1, 30, 3, 1,
                                           key="ui_streak_days", disabled=not streak_on)
-
-    # ---------- 单只股票体检 ----------
-    st.divider()
-    st.subheader("🧪 单只股票体检")
-    test_input = st.text_input("输入股票代码或名称", key="test_code")
-    test_button = st.button("开始体检", key="test_btn")
-    if test_button and test_input:
-        test_input = test_input.strip()
-        test_code = None
-        if test_input.isdigit() and len(test_input) == 6:
-            test_code = test_input
-        else:
-            with st.spinner(f"正在查找「{test_input}」..."):
-                try:
-                    all_stocks = ak.stock_info_a_code_name()
-                    match = all_stocks[all_stocks["name"].str.contains(test_input, na=False)]
-                    if not match.empty:
-                        test_code = str(match.iloc[0]["code"]).zfill(6)
-                        st.info(f"✅ {match.iloc[0]['name']} → {test_code}")
-                    else:
-                        st.error(f"❌ 找不到「{test_input}」")
-                except Exception as e:
-                    st.error(f"❌ {e}")
-        if test_code:
-            with st.spinner("拉取中..."):
-                t_df, t_err = load_or_update_kline(test_code, days=history_days)
-                t_fund = get_fundamental_data(test_code)
-            if t_df is None or len(t_df) < 60:
-                st.error(f"❌ 拉取失败：{t_err}")
-            else:
-                try:
-                    tdf = wrap(t_df.copy())
-                    tdf.get("macd"); tdf.get("atr"); _ = tdf["rsi_6"]
-                    tdf_kdj = calc_kdj(t_df)
-                    tdf["kdjk"] = tdf_kdj["kdjk"].values
-                    tdf["kdjd"] = tdf_kdj["kdjd"].values
-                    tdf["kdjj"] = tdf_kdj["kdjj"].values
-
-                    tw  = to_weekly(t_df)
-                    wdf = calc_kdj(tw)
-
-                    tm  = to_monthly(t_df)
-                    mdf = calc_kdj(tm)
-
-                    st.success(f"✅ {t_df['date'].max().strftime('%Y-%m-%d')}")
-                    chart_df = t_df.set_index("date")[["close"]].copy(); chart_df.columns = ["收盘价"]
-                    st.line_chart(chart_df, height=160)
-                    r1 = st.columns(5)
-                    r1[0].metric("最新价", round(t_df["close"].iloc[-1], 2))
-                    r1[1].metric("日K", round(tdf["kdjk"].iloc[-1], 2))
-                    r1[2].metric("日D", round(tdf["kdjd"].iloc[-1], 2))
-                    r1[3].metric("周K", round(wdf["kdjk"].iloc[-1], 2) if len(tw) >= 12 else "N/A")
-                    r1[4].metric("周D", round(wdf["kdjd"].iloc[-1], 2) if len(tw) >= 12 else "N/A")
-                    r2 = st.columns(5)
-                    r2[0].metric("月K", round(mdf["kdjk"].iloc[-1], 2) if len(tm) >= 6 else "N/A")
-                    r2[1].metric("月D", round(mdf["kdjd"].iloc[-1], 2) if len(tm) >= 6 else "N/A")
-                    r2[2].metric("RSI6", round(tdf["rsi_6"].iloc[-1], 2))
-                    r2[3].metric("ATR%", round(tdf["atr"].iloc[-1] / t_df["close"].iloc[-1] * 100, 2))
-                    r2[4].metric("PE", t_fund["PE"] if t_fund["PE"] is not None else "N/A")
-                except Exception as e:
-                    st.error(f"❌ {e}")
-
 
 # ============================================================
 # 条件概览
@@ -1534,7 +1539,10 @@ if start_button:
         comp_df = comp_df[comp_df["code"].isin(wl)].reset_index(drop=True)
         st.info(f"已过滤为自选股 {len(comp_df)} 只")
 
-    st.success(f"✅ {index_name} 共 {len(comp_df)} 只股票")
+    # 【修复2】显示成分股数量校验
+    expected = INDEX_EXPECTED_COUNT.get(index_code)
+    st.success(f"✅ {index_name} 共 {len(comp_df)} 只股票" + (f"（理论约 {expected} 只）" if expected else ""))
+
     suspended_set = get_suspended_stocks() if skip_st else set()
 
     # ===== 第一阶段：技术面 =====
@@ -1591,6 +1599,7 @@ if start_button:
 
     # ===== 第二阶段：基本面 =====
     final_results = []
+    rejected_fund = []  # 【修复1】记录被基本面拒掉的股票，方便排查
     if fund_on and tech_passed:
         st.markdown("### 💰 第二阶段：基本面筛选")
         fund_bar = st.progress(0, text="拉取基本面...")
@@ -1604,24 +1613,58 @@ if start_button:
             item.update({"PE": fund["PE"], "PB": fund["PB"], "总市值(亿)": fund["总市值(亿)"],
                          "ROE(%)": fund["ROE(%)"], "净利润增速(%)": fund["净利润增速(%)"],
                          "营收增速(%)": fund["营收增速(%)"]})
+
+            # 【修复1】缺失数据 → 直接拒掉；每条规则单独判断，记录拒因
             ok = True
-            if pe_on and fund["PE"] is not None:
-                if not (pe_min <= fund["PE"] <= pe_max): ok = False
-            if pb_on and fund["PB"] is not None:
-                if not (pb_min <= fund["PB"] <= pb_max): ok = False
-            if roe_on and fund["ROE(%)"] is not None:
-                if fund["ROE(%)"] < roe_min: ok = False
-            if mv_on and fund["总市值(亿)"] is not None:
-                if fund["总市值(亿)"] < mv_min: ok = False
-            if profit_on and fund["净利润增速(%)"] is not None:
-                if fund["净利润增速(%)"] < profit_min: ok = False
-            if rev_on and fund["营收增速(%)"] is not None:
-                if fund["营收增速(%)"] < rev_min: ok = False
+            reasons = []
+
+            if pe_on:
+                if fund["PE"] is None:
+                    ok = False; reasons.append("PE缺失")
+                elif not (pe_min <= fund["PE"] <= pe_max):
+                    ok = False; reasons.append(f"PE={fund['PE']:.1f}超出[{pe_min},{pe_max}]")
+
+            if pb_on:
+                if fund["PB"] is None:
+                    ok = False; reasons.append("PB缺失")
+                elif not (pb_min <= fund["PB"] <= pb_max):
+                    ok = False; reasons.append(f"PB={fund['PB']:.2f}超出[{pb_min},{pb_max}]")
+
+            if roe_on:
+                if fund["ROE(%)"] is None:
+                    ok = False; reasons.append("ROE缺失")
+                elif fund["ROE(%)"] < roe_min:
+                    ok = False; reasons.append(f"ROE={fund['ROE(%)']:.1f}<{roe_min}")
+
+            if mv_on:
+                if fund["总市值(亿)"] is None:
+                    ok = False; reasons.append("市值缺失")
+                elif fund["总市值(亿)"] < mv_min:
+                    ok = False; reasons.append(f"市值={fund['总市值(亿)']:.1f}<{mv_min}")
+
+            if profit_on:
+                if fund["净利润增速(%)"] is None:
+                    ok = False; reasons.append("净利润增速缺失")
+                elif fund["净利润增速(%)"] < profit_min:
+                    ok = False; reasons.append(f"净利润增速={fund['净利润增速(%)']:.1f}<{profit_min}")
+
+            if rev_on:
+                if fund["营收增速(%)"] is None:
+                    ok = False; reasons.append("营收增速缺失")
+                elif fund["营收增速(%)"] < rev_min:
+                    ok = False; reasons.append(f"营收增速={fund['营收增速(%)']:.1f}<{rev_min}")
+
             if ok:
                 fund_pass.append(item)
+            else:
+                rejected_fund.append({"代码": code, "名称": name, "拒因": " | ".join(reasons)})
+
         fund_bar.empty()
         fund_status.empty()
-        st.info(f"第二阶段完成：基本面通过 **{len(fund_pass)}** 只")
+        st.info(f"第二阶段完成：基本面通过 **{len(fund_pass)}** 只（被拒 {len(rejected_fund)} 只）")
+        if rejected_fund:
+            with st.expander(f"🔎 查看被基本面拒掉的 {len(rejected_fund)} 只（含拒因）", expanded=False):
+                st.dataframe(pd.DataFrame(rejected_fund), use_container_width=True, hide_index=True)
         final_results = fund_pass
     else:
         final_results = tech_passed
@@ -1635,7 +1678,6 @@ if start_button:
         item["评分明细"] = detail
     final_results = sorted(final_results, key=lambda x: x.get("综合评分", 0), reverse=True)
 
-        # ===== 保存历史 =====
     save_history(index_name, logic_mode, conditions, final_results)
     st.session_state["last_results"] = final_results
     st.session_state["last_all_scanned"] = all_scanned
@@ -1645,10 +1687,173 @@ if start_button:
     st.session_state["last_fail_reasons"] = fail_reasons
     st.session_state["last_index_name"] = index_name
     st.session_state["last_comp_count"] = len(comp_df)
+# ============================================================
+# 结果展示
+# ============================================================
+if "last_results" in st.session_state:
+    final_results = st.session_state["last_results"]
+    all_scanned = st.session_state.get("last_all_scanned", [])
+    tech_passed_count = st.session_state.get("last_tech_passed_count", 0)
+    failed = st.session_state.get("last_failed", 0)
+    skipped = st.session_state.get("last_skipped", 0)
+    fail_reasons = st.session_state.get("last_fail_reasons", {})
+    index_name_display = st.session_state.get("last_index_name", "")
+    comp_count = st.session_state.get("last_comp_count", 0)
 
+    st.divider()
+    st.subheader("🎉 最终筛选结果")
+    
+    # 改为5列，最后一列放排序下拉框
+    c1, c2, c3, c4, c5 = st.columns([2, 2, 2, 2, 3])
+    c1.metric("扫描股票数", comp_count)
+    c2.metric("技术面命中", tech_passed_count)
+    c3.metric("最终结果", len(final_results))
+    c4.metric("已过滤", skipped)
+
+    if failed > 0:
+        with st.expander(f"⚠️ {failed} 只拉取失败"):
+            for k, v in list(fail_reasons.items())[:10]:
+                st.write(f"**{k}**: {v}")
+
+    if final_results:
+        df = pd.DataFrame(final_results)
+        col_order = ["代码", "名称", "综合评分", "最新价", "涨跌幅(%)",
+                     "PE", "PB", "ROE(%)", "总市值(亿)", "净利润增速(%)", "营收增速(%)",
+                     "日K", "日D", "日J", "周K", "周D", "周J", "月K", "月D", "月J",
+                     "RSI6", "ATR%", "命中条件", "评分明细"]
+        display_cols = [c for c in col_order if c in df.columns]
+        df_display = df[display_cols]
+
+        # 把排序逻辑塞进 c5 里
+        with c5:
+            st.write("")  # 微调对齐，让下拉框和指标的数值行对齐
+            sort_by = st.selectbox(
+                "排序依据",
+                ["综合评分", "涨跌幅(%)", "最新价"] + [c for c in ["周K", "月K", "RSI6", "PE"] if c in df_display.columns],
+                index=0, key="sort_by",
+            )
+        
+        # 删除了升序复选框，直接固定为降序（分数高的在前面）
+        df_display = df_display.sort_values(sort_by, ascending=False).reset_index(drop=True)
+
+        exp1, exp2 = st.columns(2)
+        with exp1:
+            csv_data = df.to_csv(index=False, encoding="utf-8-sig")
+            st.download_button(
+                "📥 下载 CSV", data=csv_data,
+                file_name=f"筛选结果_{index_name_display}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                mime="text/csv", use_container_width=True,
+            )
+        with exp2:
+            if HAS_OPENPYXL:
+                xlsx_data = export_to_excel(df)
+                st.download_button(
+                    "📊 下载 Excel（带格式）", data=xlsx_data,
+                    file_name=f"筛选结果_{index_name_display}_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+            else:
+                st.caption("安装 openpyxl 后可导出 Excel")
+
+        st.caption("💡 点击表格中的任意一行，右侧会显示该股票的K线图和详情。")
+        col_left, col_right = st.columns([3, 2])
+
+        df_display = df_display.copy()
+
+        df_display["评分标签"] = df_display["综合评分"].apply(
+            lambda x: "🔥🔥🔥" if x >= 80 else ("🔥🔥" if x >= 60 else ("🔥" if x >= 40 else ""))
+        )
+
+        df_display["涨跌幅(%)"] = df_display["涨跌幅(%)"].apply(
+            lambda x: f"🔴 +{x:.2f}%" if x > 0 else (f"🟢 {x:.2f}%" if x < 0 else f"⚪ {x:.2f}%")
+        )
+
+        for col in ["周K", "月K", "日K"]:
+            if col in df_display.columns:
+                df_display[col] = df_display[col].apply(
+                    lambda x: f"🔥 {x:.1f}" if pd.notna(x) and x < 20 else (
+                        f"🚨 {x:.1f}" if pd.notna(x) and x > 80 else f"{x:.1f}" if pd.notna(x) else ""
+                    )
+                )
+
+        if "评分标签" in df_display.columns:
+            cols = df_display.columns.tolist()
+            cols.insert(cols.index("综合评分") + 1, cols.pop(cols.index("评分标签")))
+            df_display = df_display[cols]
+
+        with col_left:
+            sel = st.dataframe(
+                df_display,
+                use_container_width=True,
+                height=520,
+                on_select="rerun",
+                selection_mode="single-row",
+                key="result_table",
+                column_config={
+                    "综合评分": st.column_config.ProgressColumn(
+                        "综合评分",
+                        help="综合评分，最高150分",
+                        format="%d",
+                        min_value=0,
+                        max_value=150,
+                    ),
+                    "涨跌幅(%)": st.column_config.TextColumn("涨跌幅(%)", width="small"),
+                    "日K": st.column_config.TextColumn("日K", width="small"),
+                    "周K": st.column_config.TextColumn("周K", width="small"),
+                    "月K": st.column_config.TextColumn("月K", width="small"),
+                    "代码": st.column_config.TextColumn("代码", width="small"),
+                    "名称": st.column_config.TextColumn("名称", width="small"),
+                    "命中条件": st.column_config.TextColumn("命中条件", width="large"),
+                },
+            )
+
+        with col_right:
+            selected_rows = []
+            try:
+                if sel is not None and hasattr(sel, "selection"):
+                    selected_rows = sel.selection.get("rows", []) if isinstance(sel.selection, dict) else sel.selection.rows
+            except Exception:
+                selected_rows = []
+            if selected_rows:
+                row_idx = selected_rows[0]
+                sc = str(df_display.iloc[row_idx]["代码"]).zfill(6)
+                sn = df_display.iloc[row_idx]["名称"]
+                st.markdown(f"### 📌 {sc} {sn}")
+                detail_df, _ = load_or_update_kline(sc, days=min(history_days, 250))
+                if detail_df is not None and len(detail_df) > 20:
+                    chart_df = detail_df.set_index("date")[["close"]].copy()
+                    chart_df.columns = ["收盘价"]
+                    st.line_chart(chart_df, height=200)
+                    try:
+                        ddf = wrap(detail_df.copy())
+                        _ = ddf.get("kdj"); _ = ddf.get("macd"); _ = ddf.get("atr")
+                        m1 = st.columns(3)
+                        m1[0].metric("最新价", round(detail_df["close"].iloc[-1], 2))
+                        m1[1].metric("日K", round(ddf["kdjk"].iloc[-1], 2))
+                        m1[2].metric("日D", round(ddf["kdjd"].iloc[-1], 2))
+                        m2 = st.columns(3)
+                        m2[0].metric("日J", round(ddf["kdjj"].iloc[-1], 2))
+                        m2[1].metric("MACD", round(ddf["macd"].iloc[-1], 3))
+                        m2[2].metric("ATR%", round(ddf["atr"].iloc[-1] / detail_df["close"].iloc[-1] * 100, 2))
+                    except Exception:
+                        pass
+                    recent = detail_df.tail(5)[["date", "open", "high", "low", "close", "volume"]].copy()
+                    recent["date"] = recent["date"].dt.strftime("%Y-%m-%d")
+                    recent.columns = ["日期", "开盘", "最高", "最低", "收盘", "成交量"]
+                    st.dataframe(recent, use_container_width=True, hide_index=True)
+                else:
+                    st.warning("无法加载K线数据。")
+            else:
+                st.info("👈 点击左侧表格行查看详情。")
+    else:
+        st.warning("⚠️ 没有股票满足条件。")
+        if all_scanned:
+            st.subheader("📊 已扫描快照（前20只）")
+            st.dataframe(pd.DataFrame(all_scanned).head(20), use_container_width=True)
 
 # ============================================================
-# 历史筛选记录（页面底部）
+# 历史筛选记录
 # ============================================================
 st.divider()
 st.subheader("📚 历史筛选记录")
@@ -1678,8 +1883,7 @@ else:
             "条件摘要": st.column_config.TextColumn("条件摘要", width="large"),
         },
     )
-    
-    # ---------- 删除功能 ----------
+
     del_col1, del_col2, del_col3 = st.columns([2, 1, 1])
     with del_col1:
         del_options = ["不删除"] + [
@@ -1710,7 +1914,6 @@ else:
                 st.rerun()
             else:
                 st.error("清空失败，请重试。")
-
     hist_id = st.selectbox(
         "查看某次详情",
         ["不查看"] + [
@@ -1719,6 +1922,7 @@ else:
         ],
         key="hist_sel",
     )
+
     if hist_id != "不查看":
         try:
             hid = int(hist_id.split(" ")[0].replace("#", ""))
@@ -1726,10 +1930,53 @@ else:
             if detail and detail["results"]:
                 idx_name = detail.get("index_name") or "未知指数"
                 st.markdown(f"**{detail['run_time']} | {idx_name}**")
+
                 hdf = pd.DataFrame(detail["results"])
                 if "综合评分" in hdf.columns:
                     hdf = hdf.sort_values("综合评分", ascending=False)
-                st.dataframe(hdf, use_container_width=True, height=400)
+
+                if not hdf.empty:
+                    hdf = hdf.copy()
+
+                    if "综合评分" in hdf.columns:
+                        hdf["评分标签"] = hdf["综合评分"].apply(
+                            lambda x: "🔥🔥🔥" if x >= 80 else ("🔥🔥" if x >= 60 else ("🔥" if x >= 40 else ""))
+                        )
+
+                    if "涨跌幅(%)" in hdf.columns:
+                        hdf["涨跌幅(%)"] = hdf["涨跌幅(%)"].apply(
+                            lambda x: f"🔴 +{x:.2f}%" if pd.notna(x) and x > 0 else (
+                                f"🟢 {x:.2f}%" if pd.notna(x) and x < 0 else (
+                                    f"⚪ {x:.2f}%" if pd.notna(x) else ""
+                                )
+                            )
+                        )
+
+                    for col in ["日K", "周K", "月K"]:
+                        if col in hdf.columns:
+                            hdf[col] = hdf[col].apply(
+                                lambda x: f"🔥 {x:.1f}" if pd.notna(x) and x < 20 else (
+                                    f"🚨 {x:.1f}" if pd.notna(x) and x > 80 else (
+                                        f"{x:.1f}" if pd.notna(x) else ""
+                                    )
+                                )
+                            )
+
+                    if "评分标签" in hdf.columns and "综合评分" in hdf.columns:
+                        cols = hdf.columns.tolist()
+                        cols.insert(cols.index("综合评分") + 1, cols.pop(cols.index("评分标签")))
+                        hdf = hdf[cols]
+
+                st.dataframe(
+                    hdf,
+                    use_container_width=True,
+                    height=400,
+                    column_config={
+                        "综合评分": st.column_config.ProgressColumn(
+                            "综合评分", format="%d", min_value=0, max_value=150,
+                        )
+                    }
+                )
             else:
                 st.info("该次筛选没有结果。")
         except Exception as e:
@@ -1737,20 +1984,117 @@ else:
 
 st.caption("💡 数据来自东方财富、新浪财经、乐咕乐股（AKShare）。缓存目录：data/。")
 
-
-
-# ============================================================
-# 回测分析（追加在文件末尾）
-# ============================================================
 st.divider()
+st.subheader("📢 业绩预告查询")
+st.caption("查询指定指数成分股中，哪些公司已经发布了业绩预告。")
 
+fc1, fc2 = st.columns([2, 2])
+with fc1:
+    forecast_index = st.selectbox("选择股票池", list(INDEX_CODE_MAP.keys()), key="fc_index")
+with fc2:
+    forecast_period = st.selectbox(
+        "报告期",
+        ["2026年三季报 (20260930)", "2026年中报 (20260630)",
+         "2026年一季报 (20260331)", "2025年年报 (20251231)"],
+        key="fc_period",
+    )
+
+if st.button("🔍 查询业绩预告", key="fc_run", type="primary"):
+    period_code = forecast_period.split("(")[1].replace(")", "").strip()
+    index_code_fc = INDEX_CODE_MAP[forecast_index]
+
+    with st.spinner(f"正在获取 {forecast_index} 成分股..."):
+        comp_df_fc, comp_err_fc = get_index_components(index_code_fc)
+    if comp_df_fc is None:
+        st.error(f"获取成分股失败：{comp_err_fc}")
+    else:
+        with st.spinner(f"正在获取 {forecast_period} 业绩预告..."):
+            forecast_df, fc_err = get_earnings_forecast(period_code)
+
+        if forecast_df is None:
+            st.warning(fc_err)
+        else:
+            # 过滤出成分股中的预告
+            matched = filter_forecast_by_components(forecast_df, comp_df_fc)
+
+            if matched.empty:
+                st.info(f"📭 {forecast_index} 成分股中，暂无公司发布 {forecast_period} 业绩预告。")
+            else:
+                # ---------- 1. 合并同一只股票的多行数据 ----------
+                # 定义聚合规则：文本列拼接，其余列取第一条
+                text_cols = ["业绩变动", "业绩变动原因", "业绩变动幅度"]
+                agg_rules = {}
+                for col in matched.columns:
+                    # 【修复】跳过分组键“代码”，避免 reset_index 时列名冲突
+                    if col == "代码":
+                        continue
+                    if col in text_cols:
+                        # 用换行符拼接同一只股票的不同预告指标
+                        agg_rules[col] = lambda x: "\n".join([str(i) for i in x if pd.notna(i)])
+                    else:
+                        agg_rules[col] = "first"
+
+                # 按股票代码分组汇总
+                merged_df = matched.groupby("代码").agg(agg_rules).reset_index()
+
+                # ---------- 2. 关联股票名称 ----------
+                # 从成分股表中建立 代码 -> 名称 的映射
+                code_to_name = dict(zip(comp_df_fc["code"], comp_df_fc["name"]))
+                # 如果没有映射到，用东财自带的"股票简称"兜底（如果有这一列）
+                fallback_name_col = None
+                for c in merged_df.columns:
+                    if "简称" in str(c) or ("名称" in str(c) and c != "股票名称"):
+                        fallback_name_col = c
+                        break
+                merged_df["股票名称"] = merged_df["代码"].map(code_to_name)
+                if fallback_name_col:
+                    merged_df["股票名称"] = merged_df["股票名称"].fillna(merged_df[fallback_name_col])
+
+                # ---------- 3. 筛选并排序列 ----------
+                # 定义理想列顺序（代码、名称、预告类型、变动幅度、变动、原因、公告日期）
+                ideal_cols = ["代码", "股票名称", "预告类型", "业绩变动幅度", "业绩变动", "业绩变动原因", "公告日期"]
+                # 只保留 merged_df 中确实存在的列，并且防止重复
+                show_cols = []
+                for c in ideal_cols:
+                    if c in merged_df.columns and c not in show_cols:
+                        show_cols.append(c)
+                # 把其他遗漏的有用列也加进来（如果有）
+                for c in merged_df.columns:
+                    if c not in show_cols and c != "代码" and c != fallback_name_col:
+                        if any(k in str(c) for k in ["预告", "变动", "原因"]):
+                            show_cols.append(c)
+
+                display_fc = merged_df[show_cols].copy()
+
+                # ---------- 4. 按预告类型排序（预增、扭亏排前面） ----------
+                if "预告类型" in display_fc.columns:
+                    type_order = {"预增": 0, "略增": 1, "续盈": 2, "扭亏": 3,
+                                  "续亏": 4, "首亏": 5, "略减": 6, "预减": 7}
+                    display_fc["_sort"] = display_fc["预告类型"].map(type_order).fillna(99)
+                    display_fc = display_fc.sort_values("_sort").drop(columns=["_sort"])
+
+                st.success(f"✅ {forecast_index} 中有 **{len(display_fc)}** 家公司已发布 {forecast_period} 业绩预告")
+                st.dataframe(
+                    display_fc, 
+                    use_container_width=True, 
+                    hide_index=True,
+                    height=min(400, len(display_fc) * 50 + 50)  # 动态调整高度
+                )
+
+                # 下载按钮（下载合并后的数据）
+                csv_fc = display_fc.to_csv(index=False, encoding="utf-8-sig")
+                st.download_button(
+                    "📥 下载业绩预告 CSV",
+                    data=csv_fc,
+                    file_name=f"业绩预告_{forecast_index}_{period_code}.csv",
+                    mime="text/csv",
+                )
 
 # ============================================================
-# 回测分析（升级版：手续费 + 基准对比 + 样本量提示）
+# 回测分析
 # ============================================================
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_index_hist(index_code="000300", days=600):
-    """获取指数历史行情，用于基准对比"""
     end_date = pd.Timestamp.today().strftime("%Y%m%d")
     start_date = (pd.Timestamp.today() - pd.Timedelta(days=days * 2)).strftime("%Y%m%d")
     try:
@@ -1767,7 +2111,6 @@ def get_index_hist(index_code="000300", days=600):
 
 
 def calc_benchmark_return(bench_df, screen_date, hold_days):
-    """计算沪深300同期涨幅"""
     if bench_df is None or bench_df.empty:
         return {}
     before = bench_df[bench_df["date"] <= screen_date]
@@ -1787,7 +2130,6 @@ st.divider()
 st.subheader("🧪 回测分析")
 st.caption("假设筛选日收盘价买入，持有 N 个交易日后按收盘价卖出。已扣除交易成本。")
 
-# ---------- 交易成本设置 ----------
 with st.expander("⚙️ 交易成本设置（影响净收益计算）", expanded=False):
     st.markdown("""
 **A股单次交易成本说明**：
@@ -1802,7 +2144,6 @@ with st.expander("⚙️ 交易成本设置（影响净收益计算）", expande
         "单次交易总成本（%）",
         min_value=0.0, max_value=1.0, value=0.3, step=0.05,
         key="bt_cost",
-        help="买入+卖出的总成本。0.3% 是常见估算，包含佣金、印花税、过户费、滑点。",
     )
 
 bt_hist_df = load_history(limit=50)
@@ -1860,7 +2201,6 @@ else:
                     f"**股票数**：{len(results)} 只"
                 )
 
-                # ---------- 样本量提示 ----------
                 n_samples = len(results)
                 if n_samples < 5:
                     st.error(f"⚠️ 样本量仅 **{n_samples}** 只，统计意义极弱。建议至少 10 只以上再做判断。")
@@ -1871,12 +2211,10 @@ else:
                 else:
                     st.success(f"✅ 样本量 **{n_samples}** 只，统计意义较好。")
 
-                # ---------- 计算基准 ----------
                 with st.spinner("正在拉取沪深300基准数据..."):
                     bench_df = get_index_hist("000300", days=600)
                     bench_returns = calc_benchmark_return(bench_df, screen_date, hold_days)
 
-                # ---------- 逐只回测 ----------
                 progress = st.progress(0, text="回测中...")
                 bt_rows = []
                 for i, item in enumerate(results):
@@ -1931,7 +2269,6 @@ else:
                 else:
                     bt_df = pd.DataFrame(bt_rows)
 
-                    # ---------- 汇总统计 ----------
                     st.markdown("### 📊 汇总统计")
                     stats = []
                     for n in hold_days:
@@ -1988,10 +2325,7 @@ else:
                             "💡 **超额收益**：策略平均收益 − 沪深300同期涨幅。>0 表示跑赢大盘。"
                         )
 
-                    # ---------- 每只股票明细 ----------
                     st.markdown("### 📋 每只股票明细")
-
-                    # 明细列重排：代码、名称、评分、筛选日价格、各持有期净收益、最大涨跌、毛收益（隐藏）
                     net_cols = [f"{n}日净收益%" for n in hold_days if f"{n}日净收益%" in bt_df.columns]
                     show_cols = ["代码", "名称", "综合评分", "筛选日价格"] + net_cols + ["最大涨幅%", "最大回撤%"]
                     show_cols = [c for c in show_cols if c in bt_df.columns]
@@ -1999,7 +2333,6 @@ else:
 
                     st.dataframe(bt_display, use_container_width=True, height=420)
 
-                    # ---------- 下载 ----------
                     csv_bt = bt_df.to_csv(index=False, encoding="utf-8-sig")
                     st.download_button(
                         "📥 下载回测明细 CSV",
@@ -2012,122 +2345,3 @@ else:
                         f"💡 卖出价用的是筛选日之后第 N 个交易日的收盘价，"
                         f"已扣除 {cost_pct}% 的双边交易成本。未考虑停牌、涨跌停无法成交等情况。"
                     )
-                    
-
-# ============================================================
-# 结果展示（独立块：即使点击表格行触发 rerun，也能稳定显示）
-# ============================================================
-if "last_results" in st.session_state:
-    final_results = st.session_state["last_results"]
-    all_scanned = st.session_state.get("last_all_scanned", [])
-    tech_passed_count = st.session_state.get("last_tech_passed_count", 0)
-    failed = st.session_state.get("last_failed", 0)
-    skipped = st.session_state.get("last_skipped", 0)
-    fail_reasons = st.session_state.get("last_fail_reasons", {})
-    index_name_display = st.session_state.get("last_index_name", "")
-    comp_count = st.session_state.get("last_comp_count", 0)
-
-    st.divider()
-    st.subheader("🎉 最终筛选结果")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("扫描股票数", comp_count)
-    c2.metric("技术面命中", tech_passed_count)
-    c3.metric("最终结果", len(final_results))
-    c4.metric("已过滤", skipped)
-
-    if failed > 0:
-        with st.expander(f"⚠️ {failed} 只拉取失败"):
-            for k, v in list(fail_reasons.items())[:10]:
-                st.write(f"**{k}**: {v}")
-
-    if final_results:
-        df = pd.DataFrame(final_results)
-        col_order = ["代码", "名称", "综合评分", "最新价", "涨跌幅(%)",
-                     "PE", "PB", "ROE(%)", "总市值(亿)", "净利润增速(%)", "营收增速(%)",
-                     "日K", "日D", "日J", "周K", "周D", "周J", "月K", "月D", "月J",
-                     "RSI6", "ATR%", "命中条件", "评分明细"]
-        display_cols = [c for c in col_order if c in df.columns]
-        df_display = df[display_cols]
-
-        sort_col1, sort_col2 = st.columns([3, 1])
-        with sort_col2:
-            sort_by = st.selectbox(
-                "排序依据",
-                ["综合评分", "涨跌幅(%)", "最新价"] + [c for c in ["周K", "月K", "RSI6", "PE"] if c in df_display.columns],
-                index=0, key="sort_by",
-            )
-            sort_asc = st.checkbox("升序", value=False, key="sort_asc")
-        df_display = df_display.sort_values(sort_by, ascending=sort_asc).reset_index(drop=True)
-
-        exp1, exp2 = st.columns(2)
-        with exp1:
-            csv_data = df.to_csv(index=False, encoding="utf-8-sig")
-            st.download_button(
-                "📥 下载 CSV", data=csv_data,
-                file_name=f"筛选结果_{index_name_display}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-                mime="text/csv", use_container_width=True,
-            )
-        with exp2:
-            if HAS_OPENPYXL:
-                xlsx_data = export_to_excel(df)
-                st.download_button(
-                    "📊 下载 Excel（带格式）", data=xlsx_data,
-                    file_name=f"筛选结果_{index_name_display}_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True,
-                )
-            else:
-                st.caption("安装 openpyxl 后可导出 Excel")
-
-        st.caption("💡 点击表格中的任意一行，右侧会显示该股票的K线图和详情。")
-        col_left, col_right = st.columns([3, 2])
-
-        with col_left:
-            sel = st.dataframe(
-                df_display, use_container_width=True, height=520,
-                on_select="rerun", selection_mode="single-row", key="result_table",
-            )
-
-        with col_right:
-            selected_rows = []
-            try:
-                if sel is not None and hasattr(sel, "selection"):
-                    selected_rows = sel.selection.get("rows", []) if isinstance(sel.selection, dict) else sel.selection.rows
-            except Exception:
-                selected_rows = []
-            if selected_rows:
-                row_idx = selected_rows[0]
-                sc = str(df_display.iloc[row_idx]["代码"]).zfill(6)
-                sn = df_display.iloc[row_idx]["名称"]
-                st.markdown(f"### 📌 {sc} {sn}")
-                detail_df, _ = load_or_update_kline(sc, days=min(history_days, 250))
-                if detail_df is not None and len(detail_df) > 20:
-                    chart_df = detail_df.set_index("date")[["close"]].copy()
-                    chart_df.columns = ["收盘价"]
-                    st.line_chart(chart_df, height=200)
-                    try:
-                        ddf = wrap(detail_df.copy())
-                        _ = ddf.get("kdj"); _ = ddf.get("macd"); _ = ddf.get("atr")
-                        m1 = st.columns(3)
-                        m1[0].metric("最新价", round(detail_df["close"].iloc[-1], 2))
-                        m1[1].metric("日K", round(ddf["kdjk"].iloc[-1], 2))
-                        m1[2].metric("日D", round(ddf["kdjd"].iloc[-1], 2))
-                        m2 = st.columns(3)
-                        m2[0].metric("日J", round(ddf["kdjj"].iloc[-1], 2))
-                        m2[1].metric("MACD", round(ddf["macd"].iloc[-1], 3))
-                        m2[2].metric("ATR%", round(ddf["atr"].iloc[-1] / detail_df["close"].iloc[-1] * 100, 2))
-                    except Exception:
-                        pass
-                    recent = detail_df.tail(5)[["date", "open", "high", "low", "close", "volume"]].copy()
-                    recent["date"] = recent["date"].dt.strftime("%Y-%m-%d")
-                    recent.columns = ["日期", "开盘", "最高", "最低", "收盘", "成交量"]
-                    st.dataframe(recent, use_container_width=True, hide_index=True)
-                else:
-                    st.warning("无法加载K线数据。")
-            else:
-                st.info("👈 点击左侧表格行查看详情。")
-    else:
-        st.warning("⚠️ 没有股票满足条件。")
-        if all_scanned:
-            st.subheader("📊 已扫描快照（前20只）")
-            st.dataframe(pd.DataFrame(all_scanned).head(20), use_container_width=True)
