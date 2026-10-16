@@ -884,7 +884,7 @@ def get_all_earnings_data(period_date):
                 ("业绩变动幅度", "业绩变动幅度"),
                 ("业绩变动",     "业绩变动"),
                 ("业绩变动原因", "业绩变动原因"),
-                ("预测指标",     "预测指标"),
+                #("预测指标",     "预测指标"),
                 ("公告日期",     "公告日期"),
             ], "业绩预告")
             if p is not None:
@@ -2279,28 +2279,20 @@ if st.button("🔍 查询业绩数据（预告+快报+报表）", key="fc_run", 
                 code_to_name = dict(zip(comp_df_fc["code"], comp_df_fc["name"]))
                 if "股票简称" not in matched.columns:
                     matched["股票简称"] = None
-                matched["股票简称"] = (
-                    matched["股票简称"]
-                    .fillna(matched["代码"].map(code_to_name))
-                )
+                matched["股票简称"] = matched["股票简称"].fillna(matched["代码"].map(code_to_name))
 
                 group_keys = ["代码", "数据类型"]
                 text_cols = ["预测指标", "业绩变动", "业绩变动幅度", "业绩变动原因"]
                 agg_rules = {"股票简称": "first"}
 
                 for col in matched.columns:
-                    if col in group_keys:
-                        continue
-                    if col == "股票简称":
+                    if col in group_keys or col == "股票简称":
                         continue
                     if col in text_cols:
-                        agg_rules[col] = lambda x: "\n".join(
-                            [str(i) for i in x if pd.notna(i)]
-                        )
+                        agg_rules[col] = lambda x: "\n".join([str(i) for i in x if pd.notna(i)])
                     else:
                         agg_rules[col] = "first"
                     
-                # 行业填充
                 if "所处行业" in matched.columns:
                     industry_map = (
                         matched.dropna(subset=["所处行业"])
@@ -2328,36 +2320,106 @@ if st.button("🔍 查询业绩数据（预告+快报+报表）", key="fc_run", 
                     .reset_index(drop=True)
                 )
 
-                front = [
-                    "代码", "股票简称", "数据类型", "预告类型",
-                    "每股收益", "营业收入", "营业收入同比(%)",
-                    "净利润", "净利润同比(%)", "净资产收益率(%)",
-                    "每股净资产", "销售毛利率(%)", "所处行业",
-                    "业绩变动幅度", "业绩变动", "业绩变动原因", "公告日期",
-                ]
-                show_cols = [c for c in front if c in merged.columns]
-                show_cols += [c for c in merged.columns if c not in show_cols]
-                display = merged[show_cols]
+                # ================= 1. 统一转换与清理 =================
+                # 净利润、营业收入换算为亿元（使用正则暴力提取数字，无视 None 和乱码）
+                if "净利润" in merged.columns:
+                    merged["净利润(亿)"] = pd.to_numeric(
+                        merged["净利润"].astype(str).str.replace(r'[^0-9.-]', '', regex=True), 
+                        errors='coerce'
+                    ) / 1e8
 
+                if "营业收入" in merged.columns:
+                    merged["营业收入(亿)"] = pd.to_numeric(
+                        merged["营业收入"].astype(str).str.replace(r'[^0-9.-]', '', regex=True), 
+                        errors='coerce'
+                    ) / 1e8
+
+                # ================= 2. 提取需要的列 =================
+                standard_cols = [
+                    "代码", "股票简称", "公告日期", "数据类型", "预告类型",
+                    "每股收益", "净利润(亿)", "净利润同比(%)", "净资产收益率(%)", 
+                    "每股净资产", "销售毛利率(%)", "所处行业",
+                    "业绩变动幅度", "业绩变动", "业绩变动原因"
+                ]
+                display = merged[[c for c in standard_cols if c in merged.columns]].copy()
+
+                # ================= 3. 终极清洗数字列 =================
+                num_cols = ["每股收益", "净利润(亿)", "净利润同比(%)", "净资产收益率(%)", "每股净资产", "销售毛利率(%)"]
+                for col in num_cols:
+                    if col in display.columns:
+                        display[col] = pd.to_numeric(
+                            display[col].astype(str).str.replace(r'[^0-9.-]', '', regex=True), 
+                            errors='coerce'
+                        )
+
+                # ================= 4. 格式化日期和业绩变动 =================
+                if "公告日期" in display.columns:
+                    def _format_date(x):
+                        if pd.isna(x) or str(x).strip() in ["—", "", "None", "nan"]:
+                            return ""
+                        try:
+                            if isinstance(x, (int, float)) or str(x).isdigit():
+                                return pd.to_datetime(int(x), unit='ms').strftime('%Y-%m-%d')
+                            return pd.to_datetime(x).strftime('%Y-%m-%d')
+                        except Exception:
+                            return str(x)
+                    display["公告日期"] = display["公告日期"].apply(_format_date)
+
+                import re
+                def format_change(row):
+                    change_str = str(row.get("业绩变动幅度", "")).strip()
+                    notice_type = str(row.get("预告类型", "")).strip()
+                    if change_str in ["nan", "—", "", "None"]:
+                        return "—"
+                    nums = re.findall(r"[-+]?\d*\.\d+|\d+", change_str)
+                    if not nums:
+                        return change_str
+                    formatted_nums = [f"{float(n):.2f}" for n in nums[:2]]
+                    if len(formatted_nums) == 2:
+                        res = f"{formatted_nums[0]}% ~ {formatted_nums[1]}%"
+                    elif len(formatted_nums) == 1:
+                        res = f"{formatted_nums[0]}%"
+                    else:
+                        res = change_str
+                    if "增" in notice_type or "盈" in notice_type:
+                        return f"📈 {res}"
+                    elif "减" in notice_type or "亏" in notice_type:
+                        return f"📉 {res}"
+                    return res
+
+                if "业绩变动幅度" in display.columns:
+                    display["业绩变动幅度"] = display.apply(format_change, axis=1)
+
+                # ================= 5. 统计与输出（只保留这一次！） =================
                 stats = display["数据类型"].value_counts().to_dict()
                 stat_str = " ｜ ".join(f"{k}: **{v}** 条" for k, v in stats.items())
-                st.success(
-                    f"✅ {forecast_index} 中 **{len(display)}** 条业绩数据 ｜ {stat_str}"
-                )
-                display = display.fillna("—")
+                st.success(f"✅ {forecast_index} 中 **{len(display)}** 条业绩数据 ｜ {stat_str}")
+
+                # ================= 6. 渲染表格 =================
                 st.dataframe(
                     display,
                     use_container_width=True,
                     hide_index=True,
-                    height=min(500, len(display) * 45 + 50),
-                )
-
-                csv_fc = display.to_csv(index=False, encoding="utf-8-sig")
-                st.download_button(
-                    "📥 下载业绩数据 CSV",
-                    data=csv_fc,
-                    file_name=f"业绩数据_{forecast_index}_{period_code}.csv",
-                    mime="text/csv",
+                    height=550,
+                    column_config={
+                        "代码": st.column_config.TextColumn("代码", width=80),
+                        "股票简称": st.column_config.TextColumn("股票简称", width=100),
+                        "数据类型": st.column_config.TextColumn("数据类型", width=100),
+                        "预告类型": st.column_config.TextColumn("预告类型", width=100),
+                        "公告日期": st.column_config.TextColumn("公告日期", width=100),
+                        "所处行业": st.column_config.TextColumn("所处行业", width=100),
+                        
+                        "每股收益": st.column_config.NumberColumn("每股收益", format="%.2f", width=100),
+                        "净利润(亿)": st.column_config.NumberColumn("净利润(亿)", format="%.2f", width=100),
+                        "净利润同比(%)": st.column_config.NumberColumn("净利润同比(%)", format="%.2f", width=120),
+                        "净资产收益率(%)": st.column_config.NumberColumn("净资产收益率(%)", format="%.2f", width=130),
+                        "每股净资产": st.column_config.NumberColumn("每股净资产", format="%.2f", width=110),
+                        "销售毛利率(%)": st.column_config.NumberColumn("销售毛利率(%)", format="%.2f", width=120),
+                        
+                        "业绩变动幅度": st.column_config.TextColumn("业绩变动幅度", width=150),
+                        "业绩变动": st.column_config.TextColumn("业绩变动", width=200),
+                        "业绩变动原因": st.column_config.TextColumn("业绩变动原因", width=350),
+                    }
                 )
 # ============================================================
 # 回测分析
