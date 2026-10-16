@@ -2186,7 +2186,15 @@ if st.button("🔍 查询业绩数据（预告+快报+报表）", key="fc_run", 
                         )
                     else:
                         agg_rules[col] = "first"
-
+                # 用快报/报表里的行业填充预告行的行业
+            if "所处行业" in matched.columns and "代码" in matched.columns:
+                industry_map = (
+                    matched.dropna(subset=["所处行业"])
+                    .drop_duplicates(subset=["代码"], keep="first")
+                    .set_index("代码")["所处行业"]
+                    .to_dict()
+                )
+                matched["所处行业"] = matched["代码"].map(industry_map)
                 merged = matched.groupby(group_keys).agg(agg_rules).reset_index()
 
                 type_order = {"业绩报表": 0, "业绩快报": 1, "业绩预告": 2}
@@ -2221,7 +2229,7 @@ if st.button("🔍 查询业绩数据（预告+快报+报表）", key="fc_run", 
                 st.success(
                     f"✅ {forecast_index} 中 **{len(display)}** 条业绩数据 ｜ {stat_str}"
                 )
-
+                display = display.fillna("—")
                 st.dataframe(
                     display,
                     use_container_width=True,
