@@ -4,10 +4,47 @@
 """
 import streamlit as st
 import akshare as ak
+import time
+import baostock as bs
+
+def _ensure_bs_login(force=False):
+    """确保 Baostock 已登录。10 分钟自动重登，或 force=True 强制重登。"""
+    now = time.time()
+    last = st.session_state.get("_bs_login_time", 0)
+    if force or (now - last > 600):
+        try:
+            lg = bs.login()
+            if lg.error_code == '0':
+                st.session_state["_bs_login_time"] = now
+                print("[BAOSTOCK] login ok")
+            else:
+                print(f"[BAOSTOCK] login failed: {lg.error_code} {lg.error_msg}")
+        except Exception as e:
+            print(f"[BAOSTOCK] login exception: {e}")
+
+def _bs_fetch(query_fn, *args, **kwargs):
+    """执行 Baostock 查询，失败自动重登后重试一次。返回 (rows, fields)。"""
+    for attempt in range(2):
+        try:
+            rs = query_fn(*args, **kwargs)
+            if rs is not None and rs.error_code == '0':
+                rows = []
+                while rs.next():
+                    rows.append(rs.get_row_data())
+                return rows, rs.fields
+            else:
+                print(f"[BAOSTOCK] 查询失败: {rs.error_code if rs else 'None'}")
+        except Exception as e:
+            print(f"[BAOSTOCK] 查询异常: {e}")
+
+        if attempt == 0:
+            print("[BAOSTOCK] 尝试重登...")
+            _ensure_bs_login(force=True)
+            time.sleep(0.5)
+    return [], []
 import pandas as pd
 import numpy as np
 from stockstats import wrap
-import time
 import os
 import json
 import sqlite3
@@ -672,12 +709,36 @@ def get_realtime_valuation_map():
 # ============================================================
 # 基本面
 # ============================================================
-@st.cache_data(ttl=3600, show_spinner=False)   # ← TTL 从 86400 改成 3600
+# ============================================================
+# 基本面（Baostock 数据源）
+# ============================================================
+def _bs_latest_report(bs_code, query_func, max_back=8):
+    """
+    从当前季度起往前倒推，找到最近一个有数据的季度。
+    query_func: bs.query_profit_data 或 bs.query_growth_data
+    返回 (year, quarter, rows, fields) 或 (None, None, None, None)
+    """
+    year = pd.Timestamp.today().year
+    quarter = max(1, (pd.Timestamp.today().month - 1) // 3)
+
+    for _ in range(max_back):
+        rows, fields = _bs_fetch(query_func, code=bs_code, year=year, quarter=quarter)
+        if rows:
+            return year, quarter, rows, fields
+        # 往前推一个季度
+        quarter -= 1
+        if quarter == 0:
+            quarter = 4
+            year -= 1
+
+    return None, None, None, None
+@st.cache_data(ttl=86400, show_spinner=False)
 def get_fundamental_data(stock_code):
     """
-    【修复1】每个接口带重试；返回结构中加入 "has_pe" / "has_roe" 等标记，
-    方便调用方区分"真的没数据"和"值为None"。
+    用 Baostock 获取基本面数据（替代原乐咕乐股接口）。
+    返回结构与原函数完全一致，调用方无需改动。
     """
+    _ensure_bs_login()
     result = {
         "PE": None, "PB": None, "总市值(亿)": None,
         "ROE(%)": None, "净利润增速(%)": None, "营收增速(%)": None,
@@ -685,53 +746,66 @@ def get_fundamental_data(stock_code):
         "_profit_ok": False, "_rev_ok": False,
     }
 
-    # ------ PE / PB / 市值 ------
-    for attempt in range(3):
-        try:
-            df = ak.stock_a_indicator_lg(symbol=stock_code)
-            if df is not None and not df.empty:
-                latest = df.iloc[-1]
-                pe = _safe_float(latest.get("pe_ttm"))
-                pb = _safe_float(latest.get("pb"))
-                mv = _safe_float(latest.get("total_mv"))
-                if pe is not None:
-                    result["PE"] = pe
-                    result["_pe_ok"] = True
-                if pb is not None:
-                    result["PB"] = pb
-                if mv is not None:
-                    result["总市值(亿)"] = round(mv / 1e8, 2)
-                    result["_mv_ok"] = True
-                break
-        except Exception:
-            time.sleep(1)
+    # 代码格式转换：000001 → sz.000001
+    if stock_code.startswith("6"):
+        bs_code = f"sh.{stock_code}"
+    else:
+        bs_code = f"sz.{stock_code}"
 
-    # ------ ROE / 增速 ------
-    for attempt in range(3):
-        try:
-            df = ak.stock_financial_analysis_indicator(symbol=stock_code, start_year="2022")
-            if df is not None and not df.empty:
-                latest = df.iloc[0]
-                for col in df.columns:
-                    cs = str(col)
-                    if "净资产收益率" in cs and "摊薄" not in cs and result["ROE(%)"] is None:
-                        v = _safe_float(latest[col])
-                        if v is not None:
-                            result["ROE(%)"] = v
-                            result["_roe_ok"] = True
-                    if "净利润增长率" in cs and result["净利润增速(%)"] is None:
-                        v = _safe_float(latest[col])
-                        if v is not None:
-                            result["净利润增速(%)"] = v
-                            result["_profit_ok"] = True
-                    if ("主营业务收入增长率" in cs or "营业收入增长率" in cs) and result["营收增速(%)"] is None:
-                        v = _safe_float(latest[col])
-                        if v is not None:
-                            result["营收增速(%)"] = v
-                            result["_rev_ok"] = True
-                break
-        except Exception:
-            time.sleep(1)
+    # ---- PE / PB ----
+    try:
+        rows, _ = _bs_fetch(
+            bs.query_history_k_data_plus,
+            bs_code, "date,peTTM,pbMRQ",
+            start_date=(pd.Timestamp.today() - pd.Timedelta(days=10)).strftime("%Y-%m-%d"),
+            end_date=pd.Timestamp.today().strftime("%Y-%m-%d"),
+            frequency="d", adjustflag="3",
+        )
+        if rows:
+            latest = rows[-1]
+            pe = _safe_float(latest[1])
+            pb = _safe_float(latest[2])
+            if pe is not None:
+                result["PE"] = round(pe, 2)
+                result["_pe_ok"] = True
+            if pb is not None and pb > 0:
+                result["PB"] = round(pb, 2)
+    except Exception:
+        pass
+    # ---- ROE（自动倒推 + 年化）----
+    try:
+        _, quarter, rows, fields = _bs_latest_report(bs_code, bs.query_profit_data)
+        if rows and quarter:
+            latest = rows[0]
+            for i, f in enumerate(fields):
+                if f == "roeAvg":
+                    roe = _safe_float(latest[i])
+                    if roe is not None and roe > 0:
+                        # Baostock 的 roeAvg 是"年初至今累计"
+                        # Q1 ×4、Q2 ×2、Q3 ×4/3、Q4 ×1，才是年化 ROE
+                        annualized = roe * 4 / quarter
+                        result["ROE(%)"] = round(annualized, 2)
+                        result["_roe_ok"] = True
+    except Exception:
+        pass
+    # ---- 营收 / 净利润增速（自动倒推）----
+    try:
+        _, _, rows, fields = _bs_latest_report(bs_code, bs.query_growth_data)
+        if rows:
+            latest = rows[0]
+            for i, f in enumerate(fields):
+                if f == "YOYEquity":
+                    v = _safe_float(latest[i])
+                    if v is not None:
+                        result["营收增速(%)"] = round(v * 100, 2)
+                        result["_rev_ok"] = True
+                if f == "YOYNI":
+                    v = _safe_float(latest[i])
+                    if v is not None:
+                        result["净利润增速(%)"] = round(v * 100, 2)
+                        result["_profit_ok"] = True
+    except Exception:
+        pass
 
     return result
 
@@ -1251,10 +1325,15 @@ def process_one_stock(code, name, history_days, conditions, use_and, skip_st, su
     if kline is None or len(kline) < 60:
         return {"status": "failed", "code": code, "name": name, "error": err or "数据不足60天"}
     hits, enabled_count, snap = check_stock(kline, conditions)
-    if use_and:
-        ok = (enabled_count > 0 and len(hits) >= enabled_count)
+
+    # 没勾任何技术条件 → 全部放行，交给基本面阶段
+    if enabled_count == 0:
+        ok = True
+    elif use_and:
+        ok = (len(hits) >= enabled_count)
     else:
         ok = len(hits) > 0
+
     return {"status": "done", "code": code, "name": name, "hits": hits, "snap": snap, "ok": ok}
 
 
@@ -1266,23 +1345,35 @@ def export_to_excel(df):
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="筛选结果")
         ws = writer.sheets["筛选结果"]
+
+        # ---- 列宽（安全版，避免 float 报错）----
         for i, col in enumerate(df.columns, 1):
             letter = chr(64 + i) if i <= 26 else "A" + chr(64 + i - 26)
-            max_len = max(df[col].astype(str).map(len).max() if len(df) > 0 else 0, len(str(col))) + 2
+            try:
+                max_len = int(df[col].astype(str).str.len().max())
+                if pd.isna(max_len):
+                    max_len = 0
+            except Exception:
+                max_len = 0
+            max_len = max(max_len, len(str(col))) + 2
             ws.column_dimensions[letter].width = min(max(max_len, 8), 35)
+
+        # ---- 涨跌幅颜色 ----
         if "涨跌幅(%)" in df.columns:
             col_idx = list(df.columns).index("涨跌幅(%)") + 1
             for row in range(2, len(df) + 2):
                 cell = ws.cell(row=row, column=col_idx)
                 if isinstance(cell.value, (int, float)):
                     cell.font = Font(color="C00000" if cell.value > 0 else "008000")
+
+        # ---- 表头加粗居中 ----
         for i in range(1, len(df.columns) + 1):
             cell = ws.cell(row=1, column=i)
             cell.font = Font(bold=True)
             cell.alignment = Alignment(horizontal="center")
+
     output.seek(0)
     return output.getvalue()
-
 
 # ============================================================
 # 初始化
@@ -1419,26 +1510,32 @@ with st.sidebar:
     with st.expander("💰 基本面筛选", expanded=False):
         fund_on = st.checkbox("启用基本面筛选", value=False, key="fund_on")
         st.caption("⚠️ 勾选的条件下，若某股票该指标无数据，将被直接过滤掉（不再放行）")
+
         pe_on = st.checkbox("PE(TTM) 区间", value=False, key="pe_on", disabled=not fund_on)
         pc1, pc2 = st.columns(2)
         with pc1:
-            pe_min = st.number_input("PE最小", 0.0, 200.0, 0.0, 1.0, key="pe_min", disabled=not (fund_on and pe_on))
+            pe_min = st.number_input("PE最小", 0.0, 3000.0, 0.0, 1.0, key="pe_min", disabled=not (fund_on and pe_on))
         with pc2:
-            pe_max = st.number_input("PE最大", 0.0, 200.0, 30.0, 1.0, key="pe_max", disabled=not (fund_on and pe_on))
+            pe_max = st.number_input("PE最大", 0.0, 3000.0, 30.0, 1.0, key="pe_max", disabled=not (fund_on and pe_on))
+
         pb_on = st.checkbox("PB 区间", value=False, key="pb_on", disabled=not fund_on)
         bc1, bc2 = st.columns(2)
         with bc1:
             pb_min = st.number_input("PB最小", 0.0, 50.0, 0.0, 0.1, key="pb_min", disabled=not (fund_on and pb_on))
         with bc2:
             pb_max = st.number_input("PB最大", 0.0, 50.0, 5.0, 0.1, key="pb_max", disabled=not (fund_on and pb_on))
+
         roe_on = st.checkbox("ROE 下限", value=False, key="roe_on", disabled=not fund_on)
         roe_min = st.number_input("ROE ≥ (%)", 0.0, 100.0, 10.0, 1.0, key="roe_min", disabled=not (fund_on and roe_on))
+
         mv_on = st.checkbox("总市值下限", value=False, key="mv_on", disabled=not fund_on)
         mv_min = st.number_input("总市值 ≥ (亿)", 0.0, 100000.0, 100.0, 10.0, key="mv_min", disabled=not (fund_on and mv_on))
+
         profit_on = st.checkbox("净利润增速 下限", value=False, key="profit_on", disabled=not fund_on)
         profit_min = st.number_input("净利润增速 ≥ (%)", -200.0, 500.0, 0.0, 5.0, key="profit_min", disabled=not (fund_on and profit_on))
-        rev_on = st.checkbox("营收增速 下限", value=False, key="rev_on", disabled=not fund_on)
-        rev_min = st.number_input("营收增速 ≥ (%)", -100.0, 500.0, 0.0, 5.0, key="rev_min", disabled=not (fund_on and rev_on))
+
+        rev_on = st.checkbox("净资产增速 下限", value=False, key="rev_on", disabled=not fund_on)
+        rev_min = st.number_input("净资产增速 ≥ (%)", -100.0, 500.0, 0.0, 5.0, key="rev_min", disabled=not (fund_on and rev_on))
 
     with st.expander("📊 均线类", expanded=False):
         ma_golden_on = st.checkbox("启用均线金叉", value=False, key="ui_ma_g_on")
@@ -1855,10 +1952,35 @@ if "last_results" in st.session_state:
 
     if final_results:
         df = pd.DataFrame(final_results)
-        col_order = ["代码", "名称", "综合评分", "最新价", "涨跌幅(%)",
-                     "PE", "PB", "ROE(%)", "总市值(亿)", "净利润增速(%)", "营收增速(%)",
-                     "日K", "日D", "日J", "周K", "周D", "周J", "月K", "月D", "月J",
-                     "RSI6", "ATR%", "命中条件", "评分明细"]
+
+        # ---- 动态生成列清单 ----
+        col_order = ["代码", "名称", "综合评分", "最新价", "涨跌幅(%)"]
+
+        # 基本面列：仅当勾选了对应条件时才显示
+        if fund_on and pe_on:      col_order.append("PE")
+        if fund_on and pb_on:      col_order.append("PB")
+        if fund_on and roe_on:     col_order.append("ROE(%)")
+        if fund_on and profit_on:  col_order.append("净利润增速(%)")
+        if fund_on and rev_on:     col_order.append("营收增速(%)")
+        # 总市值列：你觉得没用就不显示，想恢复就把下面这行注释解开
+        # if fund_on and mv_on:    col_order.append("总市值(亿)")
+
+        # 技术面列：仅当勾选了对应条件时才显示
+        if dk_on and dk_k_on: col_order.append("日K")
+        if dk_on and dk_d_on: col_order.append("日D")
+        if dk_on and dk_j_on: col_order.append("日J")
+        if wk_on and wk_k_on: col_order.append("周K")
+        if wk_on and wk_d_on: col_order.append("周D")
+        if wk_on and wk_j_on: col_order.append("周J")
+        if mk_on and mk_k_on: col_order.append("月K")
+        if mk_on and mk_d_on: col_order.append("月D")
+        if mk_on and mk_j_on: col_order.append("月J")
+        if rsi_on: col_order.append(f"RSI{rsi_period}")
+        if atr_on: col_order.append("ATR%")
+
+        # 尾部固定列
+        col_order += ["命中条件", "评分明细"]
+
         display_cols = [c for c in col_order if c in df.columns]
         df_display = df[display_cols]
 
@@ -2186,15 +2308,17 @@ if st.button("🔍 查询业绩数据（预告+快报+报表）", key="fc_run", 
                         )
                     else:
                         agg_rules[col] = "first"
-                # 用快报/报表里的行业填充预告行的行业
-            if "所处行业" in matched.columns and "代码" in matched.columns:
-                industry_map = (
-                    matched.dropna(subset=["所处行业"])
-                    .drop_duplicates(subset=["代码"], keep="first")
-                    .set_index("代码")["所处行业"]
-                    .to_dict()
-                )
-                matched["所处行业"] = matched["代码"].map(industry_map)
+                    
+                # 行业填充
+                if "所处行业" in matched.columns:
+                    industry_map = (
+                        matched.dropna(subset=["所处行业"])
+                        .drop_duplicates(subset=["代码"], keep="first")
+                        .set_index("代码")["所处行业"]
+                        .to_dict()
+                    )
+                    matched["所处行业"] = matched["代码"].map(industry_map)
+
                 merged = matched.groupby(group_keys).agg(agg_rules).reset_index()
 
                 type_order = {"业绩报表": 0, "业绩快报": 1, "业绩预告": 2}
