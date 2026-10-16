@@ -272,7 +272,44 @@ PRESET_STRATEGIES = {
     },
 }
 
+# ============================================================
+# 动态报告期生成（避免每年手动改代码）
+# ============================================================
+def gen_report_periods(n_years_back=1):
+    """
+    按当前月份自动生成可用的报告期下拉选项，倒序（最新在前）。
+    规则：
+        1~3月  → 上年三季报
+        4~6月  → 今年一季报
+        7~9月  → 今年中报
+        10~12月→ 今年三季报
+    n_years_back: 往前多保留几年，默认 1 年
+    """
+    today = datetime.today()
+    cur_year, cur_month = today.year, today.month
 
+    if cur_month <= 3:
+        latest = f"{cur_year - 1}0930"
+    elif cur_month <= 6:
+        latest = f"{cur_year}0331"
+    elif cur_month <= 9:
+        latest = f"{cur_year}0630"
+    else:
+        latest = f"{cur_year}0930"
+
+    all_periods = []
+    for y in range(cur_year, cur_year - n_years_back - 1, -1):
+        all_periods.append((f"{y}年年报 (1231)", f"{y}1231"))
+        all_periods.append((f"{y}年三季报 (0930)", f"{y}0930"))
+        all_periods.append((f"{y}年中报 (0630)",   f"{y}0630"))
+        all_periods.append((f"{y}年一季报 (0331)", f"{y}0331"))
+
+    return [(label, code) for label, code in all_periods if code <= latest]
+
+
+REPORT_PERIOD_OPTIONS = gen_report_periods(n_years_back=1)
+PERIOD_LABELS = [label for label, _ in REPORT_PERIOD_OPTIONS]
+PERIOD_CODES  = [code  for _, code  in REPORT_PERIOD_OPTIONS]
 # ============================================================
 # 数据获取
 # ============================================================
@@ -698,38 +735,139 @@ def get_fundamental_data(stock_code):
 
     return result
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_earnings_forecast(period_date):
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_all_earnings_data(period_date):
     """
-    获取指定报告期的全市场业绩预告。
-    period_date: 报告期季末日期，格式 YYYYMMDD，如 '20260930' 表示三季报
-    返回：DataFrame，包含代码、名称、预告类型、净利润变动幅度等
+    三合一：同时获取指定报告期的
+      · 业绩预告 (stock_yjyg_em)
+      · 业绩快报 (stock_yjkb_em)
+      · 正式业绩报表 (stock_yjbb_em)
+    每个接口都先做「去重复列 → 抽取标准列 → 重命名」，最后再 concat。
+    返回：合并后的 DataFrame（列名统一、无重复），或 (None, 错误信息)
     """
-    try:
-        df = ak.stock_yjyg_em(date=period_date)
-        if df is None or df.empty:
-            return None, f"未获取到 {period_date} 的业绩预告数据（可能该报告期尚未开始披露）"
-        # 统一代码格式
-        code_col = None
+
+    def _dedup_cols(df):
+        """去掉完全重名的列，只保留第一个"""
+        return df.loc[:, ~df.columns.duplicated()]
+
+    def _find_code_col(df):
+        """找代码列：优先带'股票'两字的，其次含'代码'的"""
+        for c in df.columns:
+            if "代码" in str(c) and "股票" in str(c):
+                return c
         for c in df.columns:
             if "代码" in str(c):
-                code_col = c; break
-        if code_col:
-            df["代码"] = df[code_col].astype(str).str.zfill(6)
-        return df, None
-    except Exception as e:
-        return None, f"获取业绩预告失败：{e}"
+                return c
+        return None
 
+    def _find_name_col(df):
+        """找名称列"""
+        for c in df.columns:
+            if "简称" in str(c):
+                return c
+        for c in df.columns:
+            if "名称" in str(c):
+                return c
+        return None
 
-def filter_forecast_by_components(forecast_df, component_df):
-    """
-    将业绩预告数据按成分股列表过滤。
-    forecast_df: get_earnings_forecast 返回的全市场预告数据
-    component_df: 指数成分股 DataFrame（含 code / name 列）
-    """
-    comp_codes = set(component_df["code"].astype(str).str.zfill(6))
-    result = forecast_df[forecast_df["代码"].isin(comp_codes)].copy()
-    return result
+    def _build(df_raw, wanted, data_type):
+        """
+        df_raw : 接口原始 DataFrame
+        wanted : [(原列名, 标准列名), ...]
+        data_type : "业绩预告" / "业绩快报" / "业绩报表"
+        """
+        df = _dedup_cols(df_raw)
+
+        # 代码列
+        code_col = _find_code_col(df)
+        if code_col is None:
+            return None
+        picked = pd.DataFrame()
+        picked["代码"] = df[code_col].astype(str).str.zfill(6)
+
+        # 名称列（统一叫"股票简称"）
+        name_col = _find_name_col(df)
+        if name_col is not None:
+            picked["股票简称"] = df[name_col]
+
+        # 抽取想要的列
+        for src, dst in wanted:
+            if src in df.columns and dst not in picked.columns:
+                picked[dst] = df[src]
+
+        # 打上类型标签
+        picked["数据类型"] = data_type
+        return picked
+
+    dfs = []
+
+    # ---------- 1. 业绩预告 ----------
+    try:
+        df_yg = ak.stock_yjyg_em(date=period_date)
+        if df_yg is not None and not df_yg.empty:
+            p = _build(df_yg, [
+                ("预告类型",     "预告类型"),
+                ("业绩变动幅度", "业绩变动幅度"),
+                ("业绩变动",     "业绩变动"),
+                ("业绩变动原因", "业绩变动原因"),
+                ("预测指标",     "预测指标"),
+                ("公告日期",     "公告日期"),
+            ], "业绩预告")
+            if p is not None:
+                dfs.append(p)
+    except Exception:
+        pass
+
+    # ---------- 2. 业绩快报 ----------
+    try:
+        df_kb = ak.stock_yjkb_em(date=period_date)
+        if df_kb is not None and not df_kb.empty:
+            p = _build(df_kb, [
+                ("每股收益",       "每股收益"),
+                ("营业收入",       "营业收入"),
+                ("净利润",         "净利润"),
+                ("净资产收益率",   "净资产收益率(%)"),
+                ("每股净资产",     "每股净资产"),
+                ("公告日期",       "公告日期"),
+            ], "业绩快报")
+            if p is not None:
+                dfs.append(p)
+    except Exception:
+        pass
+
+    # ---------- 3. 正式业绩报表 ----------
+    try:
+        df_bb = ak.stock_yjbb_em(date=period_date)
+        if df_bb is not None and not df_bb.empty:
+            p = _build(df_bb, [
+                ("每股收益",          "每股收益"),
+                # 优先用带前缀的列；若不存在，后面 fallback
+                ("营业收入-营业收入", "营业收入"),
+                ("营业收入",          "营业收入"),
+                ("营业收入-同比增长", "营业收入同比(%)"),
+                ("净利润-净利润",     "净利润"),
+                ("净利润",            "净利润"),
+                ("净利润-同比增长",   "净利润同比(%)"),
+                ("净资产收益率",      "净资产收益率(%)"),
+                ("每股净资产",        "每股净资产"),
+                ("销售毛利率",        "销售毛利率(%)"),
+                ("所处行业",          "所处行业"),
+                ("最新公告日期",      "公告日期"),
+                ("公告日期",          "公告日期"),
+            ], "业绩报表")
+            if p is not None:
+                dfs.append(p)
+    except Exception:
+        pass
+
+    if not dfs:
+        return None, f"报告期 {period_date} 暂无任何业绩数据（预告 / 快报 / 报表均为空）"
+
+    # 因为每个 p 的列已经规范化过，直接 concat 不会有重复
+    combined = pd.concat(dfs, ignore_index=True, sort=False)
+    # 再兜底去重一次（防止极端情况）
+    combined = combined.loc[:, ~combined.columns.duplicated()]
+    return combined, None
 # ============================================================
 # 辅助
 # ============================================================
@@ -1985,111 +2123,119 @@ else:
 st.caption("💡 数据来自东方财富、新浪财经、乐咕乐股（AKShare）。缓存目录：data/。")
 
 st.divider()
-st.subheader("📢 业绩预告查询")
-st.caption("查询指定指数成分股中，哪些公司已经发布了业绩预告。")
+st.subheader("📢 业绩数据查询")
+st.caption("查询指定指数成分股中，各公司发布的 **业绩预告 / 业绩快报 / 正式业绩报表**（已合并展示）。")
 
 fc1, fc2 = st.columns([2, 2])
 with fc1:
     forecast_index = st.selectbox("选择股票池", list(INDEX_CODE_MAP.keys()), key="fc_index")
 with fc2:
-    forecast_period = st.selectbox(
+    forecast_label = st.selectbox(
         "报告期",
-        ["2026年三季报 (20260930)", "2026年中报 (20260630)",
-         "2026年一季报 (20260331)", "2025年年报 (20251231)"],
+        PERIOD_LABELS,
+        index=0,                    # 默认选最新报告期
         key="fc_period",
     )
 
-if st.button("🔍 查询业绩预告", key="fc_run", type="primary"):
-    period_code = forecast_period.split("(")[1].replace(")", "").strip()
+if st.button("🔍 查询业绩数据（预告+快报+报表）", key="fc_run", type="primary"):
+    period_code = forecast_label.split("(")[1].replace(")", "").strip()
+    year = forecast_label.split("年")[0]
+    period_code = f"{year}{period_code}"
     index_code_fc = INDEX_CODE_MAP[forecast_index]
 
     with st.spinner(f"正在获取 {forecast_index} 成分股..."):
         comp_df_fc, comp_err_fc = get_index_components(index_code_fc)
+
     if comp_df_fc is None:
         st.error(f"获取成分股失败：{comp_err_fc}")
     else:
-        with st.spinner(f"正在获取 {forecast_period} 业绩预告..."):
-            forecast_df, fc_err = get_earnings_forecast(period_code)
+        with st.spinner(f"正在获取 {forecast_label} 的业绩数据..."):
+            all_df, err = get_all_earnings_data(period_code)
 
-        if forecast_df is None:
-            st.warning(fc_err)
+        if all_df is None:
+            st.warning(err)
         else:
-            # 过滤出成分股中的预告
-            matched = filter_forecast_by_components(forecast_df, comp_df_fc)
+            comp_codes = set(comp_df_fc["code"].astype(str).str.zfill(6))
+            matched = all_df[all_df["代码"].isin(comp_codes)].copy()
 
             if matched.empty:
-                st.info(f"📭 {forecast_index} 成分股中，暂无公司发布 {forecast_period} 业绩预告。")
+                st.info(f"📭 {forecast_index} 成分股中，暂无公司披露 {forecast_label} 的业绩数据。")
             else:
-                # ---------- 1. 合并同一只股票的多行数据 ----------
-                # 定义聚合规则：文本列拼接，其余列取第一条
-                text_cols = ["业绩变动", "业绩变动原因", "业绩变动幅度"]
-                agg_rules = {}
+                matched = matched.loc[:, ~matched.columns.duplicated()]
+
+                code_to_name = dict(zip(comp_df_fc["code"], comp_df_fc["name"]))
+                if "股票简称" not in matched.columns:
+                    matched["股票简称"] = None
+                matched["股票简称"] = (
+                    matched["股票简称"]
+                    .fillna(matched["代码"].map(code_to_name))
+                )
+
+                group_keys = ["代码", "数据类型"]
+                text_cols = ["预测指标", "业绩变动", "业绩变动幅度", "业绩变动原因"]
+                agg_rules = {"股票简称": "first"}
+
                 for col in matched.columns:
-                    # 【修复】跳过分组键“代码”，避免 reset_index 时列名冲突
-                    if col == "代码":
+                    if col in group_keys:
+                        continue
+                    if col == "股票简称":
                         continue
                     if col in text_cols:
-                        # 用换行符拼接同一只股票的不同预告指标
-                        agg_rules[col] = lambda x: "\n".join([str(i) for i in x if pd.notna(i)])
+                        agg_rules[col] = lambda x: "\n".join(
+                            [str(i) for i in x if pd.notna(i)]
+                        )
                     else:
                         agg_rules[col] = "first"
 
-                # 按股票代码分组汇总
-                merged_df = matched.groupby("代码").agg(agg_rules).reset_index()
+                merged = matched.groupby(group_keys).agg(agg_rules).reset_index()
 
-                # ---------- 2. 关联股票名称 ----------
-                # 从成分股表中建立 代码 -> 名称 的映射
-                code_to_name = dict(zip(comp_df_fc["code"], comp_df_fc["name"]))
-                # 如果没有映射到，用东财自带的"股票简称"兜底（如果有这一列）
-                fallback_name_col = None
-                for c in merged_df.columns:
-                    if "简称" in str(c) or ("名称" in str(c) and c != "股票名称"):
-                        fallback_name_col = c
-                        break
-                merged_df["股票名称"] = merged_df["代码"].map(code_to_name)
-                if fallback_name_col:
-                    merged_df["股票名称"] = merged_df["股票名称"].fillna(merged_df[fallback_name_col])
+                type_order = {"业绩报表": 0, "业绩快报": 1, "业绩预告": 2}
+                merged["_type_sort"] = merged["数据类型"].map(type_order).fillna(9)
 
-                # ---------- 3. 筛选并排序列 ----------
-                # 定义理想列顺序（代码、名称、预告类型、变动幅度、变动、原因、公告日期）
-                ideal_cols = ["代码", "股票名称", "预告类型", "业绩变动幅度", "业绩变动", "业绩变动原因", "公告日期"]
-                # 只保留 merged_df 中确实存在的列，并且防止重复
-                show_cols = []
-                for c in ideal_cols:
-                    if c in merged_df.columns and c not in show_cols:
-                        show_cols.append(c)
-                # 把其他遗漏的有用列也加进来（如果有）
-                for c in merged_df.columns:
-                    if c not in show_cols and c != "代码" and c != fallback_name_col:
-                        if any(k in str(c) for k in ["预告", "变动", "原因"]):
-                            show_cols.append(c)
+                if "预告类型" in merged.columns:
+                    fc_order = {"预增": 0, "略增": 1, "续盈": 2, "扭亏": 3,
+                                "续亏": 4, "首亏": 5, "略减": 6, "预减": 7}
+                    merged["_fc_sort"] = merged["预告类型"].map(fc_order).fillna(99)
+                else:
+                    merged["_fc_sort"] = 99
 
-                display_fc = merged_df[show_cols].copy()
-
-                # ---------- 4. 按预告类型排序（预增、扭亏排前面） ----------
-                if "预告类型" in display_fc.columns:
-                    type_order = {"预增": 0, "略增": 1, "续盈": 2, "扭亏": 3,
-                                  "续亏": 4, "首亏": 5, "略减": 6, "预减": 7}
-                    display_fc["_sort"] = display_fc["预告类型"].map(type_order).fillna(99)
-                    display_fc = display_fc.sort_values("_sort").drop(columns=["_sort"])
-
-                st.success(f"✅ {forecast_index} 中有 **{len(display_fc)}** 家公司已发布 {forecast_period} 业绩预告")
-                st.dataframe(
-                    display_fc, 
-                    use_container_width=True, 
-                    hide_index=True,
-                    height=min(400, len(display_fc) * 50 + 50)  # 动态调整高度
+                merged = (
+                    merged.sort_values(["_type_sort", "_fc_sort"])
+                    .drop(columns=["_type_sort", "_fc_sort"])
+                    .reset_index(drop=True)
                 )
 
-                # 下载按钮（下载合并后的数据）
-                csv_fc = display_fc.to_csv(index=False, encoding="utf-8-sig")
+                front = [
+                    "代码", "股票简称", "数据类型", "预告类型",
+                    "每股收益", "营业收入", "营业收入同比(%)",
+                    "净利润", "净利润同比(%)", "净资产收益率(%)",
+                    "每股净资产", "销售毛利率(%)", "所处行业",
+                    "业绩变动幅度", "业绩变动", "业绩变动原因", "公告日期",
+                ]
+                show_cols = [c for c in front if c in merged.columns]
+                show_cols += [c for c in merged.columns if c not in show_cols]
+                display = merged[show_cols]
+
+                stats = display["数据类型"].value_counts().to_dict()
+                stat_str = " ｜ ".join(f"{k}: **{v}** 条" for k, v in stats.items())
+                st.success(
+                    f"✅ {forecast_index} 中 **{len(display)}** 条业绩数据 ｜ {stat_str}"
+                )
+
+                st.dataframe(
+                    display,
+                    use_container_width=True,
+                    hide_index=True,
+                    height=min(500, len(display) * 45 + 50),
+                )
+
+                csv_fc = display.to_csv(index=False, encoding="utf-8-sig")
                 st.download_button(
-                    "📥 下载业绩预告 CSV",
+                    "📥 下载业绩数据 CSV",
                     data=csv_fc,
-                    file_name=f"业绩预告_{forecast_index}_{period_code}.csv",
+                    file_name=f"业绩数据_{forecast_index}_{period_code}.csv",
                     mime="text/csv",
                 )
-
 # ============================================================
 # 回测分析
 # ============================================================
