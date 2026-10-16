@@ -1938,8 +1938,8 @@ if "last_results" in st.session_state:
     st.divider()
     st.subheader("🎉 最终筛选结果")
     
-    # 改为5列，最后一列放排序下拉框
-    c1, c2, c3, c4, c5 = st.columns([2, 2, 2, 2, 3])
+    # 改为4列
+    c1, c2, c3, c4 = st.columns([2, 2, 2, 2])
     c1.metric("扫描股票数", comp_count)
     c2.metric("技术面命中", tech_passed_count)
     c3.metric("最终结果", len(final_results))
@@ -1984,17 +1984,8 @@ if "last_results" in st.session_state:
         display_cols = [c for c in col_order if c in df.columns]
         df_display = df[display_cols]
 
-        # 把排序逻辑塞进 c5 里
-        with c5:
-            st.write("")  # 微调对齐，让下拉框和指标的数值行对齐
-            sort_by = st.selectbox(
-                "排序依据",
-                ["综合评分", "涨跌幅(%)", "最新价"] + [c for c in ["周K", "月K", "RSI6", "PE"] if c in df_display.columns],
-                index=0, key="sort_by",
-            )
-        
-        # 删除了升序复选框，直接固定为降序（分数高的在前面）
-        df_display = df_display.sort_values(sort_by, ascending=False).reset_index(drop=True)
+        # 直接固定为按综合评分降序排列（分数高的在前面）
+        df_display = df_display.sort_values("综合评分", ascending=False).reset_index(drop=True)
 
         exp1, exp2 = st.columns(2)
         with exp1:
