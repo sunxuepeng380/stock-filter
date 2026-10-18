@@ -50,6 +50,7 @@ import json
 import sqlite3
 import shutil
 import io
+import re
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import warnings
@@ -60,11 +61,26 @@ st.set_page_config(page_title="股票指标筛选工具", page_icon="📈", layo
 # ============================================================
 # 全局配置
 # ============================================================
-DATA_DIR = "data/daily"
-HISTORY_DB = "data/history.db"
-WATCHLIST_FILE = "data/watchlist.json"
+DATA_DIR = "data/daily"  # K线缓存全局共享，省去重复下载
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs("data", exist_ok=True)
+
+# 🌟 新增：动态获取用户专属数据目录
+def get_user_dir():
+    user = st.session_state.get("current_user", "默认用户")
+    # 过滤非法字符，防止路径穿越
+    safe_user = re.sub(r'[\\/:*?"<>|.]', '_', str(user)).strip()
+    if not safe_user:
+        safe_user = "默认用户"
+    user_dir = os.path.join("data", "users", safe_user)
+    os.makedirs(user_dir, exist_ok=True)
+    return user_dir
+
+def get_history_db_path():
+    return os.path.join(get_user_dir(), "history.db")
+
+def get_watchlist_path():
+    return os.path.join(get_user_dir(), "watchlist.json")
 
 try:
     from openpyxl import Workbook
@@ -82,12 +98,11 @@ def _safe_float(v):
     except Exception:
         return None
 
-
 # ============================================================
-# SQLite 历史记录
+# SQLite 历史记录（用户隔离）
 # ============================================================
 def init_history_db():
-    conn = sqlite3.connect(HISTORY_DB)
+    conn = sqlite3.connect(get_history_db_path())
     conn.execute("""
         CREATE TABLE IF NOT EXISTS screening_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -105,7 +120,7 @@ def init_history_db():
 
 def save_history(index_name, logic_mode, conditions, results):
     try:
-        conn = sqlite3.connect(HISTORY_DB)
+        conn = sqlite3.connect(get_history_db_path())
         conn.execute(
             "INSERT INTO screening_history (run_time, index_name, logic_mode, conditions, result_count, results_json) VALUES (?,?,?,?,?,?)",
             (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), index_name, logic_mode,
@@ -120,7 +135,7 @@ def save_history(index_name, logic_mode, conditions, results):
 
 def load_history(limit=30):
     try:
-        conn = sqlite3.connect(HISTORY_DB)
+        conn = sqlite3.connect(get_history_db_path())
         df = pd.read_sql_query(
             f"SELECT id, run_time, index_name, logic_mode, conditions, result_count FROM screening_history ORDER BY id DESC LIMIT {limit}",
             conn)
@@ -130,98 +145,9 @@ def load_history(limit=30):
         return pd.DataFrame()
 
 
-def _to_dict(v):
-    """如果 v 是字符串形式的 dict，尝试解析成 dict；否则原样返回"""
-    if isinstance(v, dict):
-        return v
-    if isinstance(v, str):
-        try:
-            import ast
-            parsed = ast.literal_eval(v)
-            if isinstance(parsed, dict):
-                return parsed
-        except Exception:
-            pass
-    return {}
-
-
-def summarize_conditions(conditions_json):
-    """把保存的 conditions JSON 转成简短摘要文字（兼容旧数据的字符串嵌套）"""
-    try:
-        c = json.loads(conditions_json) if isinstance(conditions_json, str) else conditions_json
-    except Exception:
-        return ""
-    if not isinstance(c, dict):
-        return ""
-    parts = []
-
-    ma = _to_dict(c.get("ma_golden"))
-    if ma.get("enabled"):
-        parts.append(f"MA{ma.get('fast')}↑{ma.get('slow')}")
-    if _to_dict(c.get("ma_bull")).get("enabled"):
-        parts.append("MA多头")
-    pma = _to_dict(c.get("price_vs_ma"))
-    if pma.get("enabled"):
-        parts.append(f"价格{'>' if pma.get('relation')=='above' else '<'}MA{pma.get('period')}")
-    dev = _to_dict(c.get("ma_deviation"))
-    if dev.get("enabled"):
-        parts.append(f"偏离MA{dev.get('period')}{dev.get('op')}{dev.get('value')}%")
-
-    mc = _to_dict(c.get("macd_cross"))
-    if mc.get("enabled"):
-        parts.append("MACD" + ("金叉" if mc.get("mode") == "golden" else "死叉"))
-    mh = _to_dict(c.get("macd_hist"))
-    if mh.get("enabled"):
-        parts.append("MACD柱" + ("由负转正" if mh.get("mode") == "turn_pos" else "由正转负"))
-
-    bl = _to_dict(c.get("boll"))
-    if bl.get("enabled"):
-        parts.append(f"BOLL:{bl.get('mode')}")
-
-    for period_key, label in [("kdj_daily", "日"), ("kdj_weekly", "周"), ("kdj_monthly", "月")]:
-        kk = _to_dict(c.get(period_key))
-        for k in ["K", "D", "J"]:
-            sub = _to_dict(kk.get(k))
-            if sub.get("enabled"):
-                parts.append(f"{label}{k}{sub.get('op')}{sub.get('value')}")
-
-    kc = _to_dict(c.get("kdj_cross"))
-    if kc.get("enabled"):
-        parts.append("KDJ" + ("金叉" if kc.get("mode") == "golden" else "死叉"))
-
-    rsi = _to_dict(c.get("rsi"))
-    if rsi.get("enabled"):
-        parts.append(f"RSI{rsi.get('period')}{rsi.get('op')}{rsi.get('value')}")
-
-    vol = _to_dict(c.get("volume"))
-    if vol.get("enabled"):
-        parts.append(f"放量{vol.get('multiple')}倍")
-    vp = _to_dict(c.get("vol_price"))
-    if vp.get("enabled"):
-        parts.append("量增价升" if vp.get("mode") == "up" else "量缩价跌")
-
-    atr = _to_dict(c.get("atr"))
-    if atr.get("enabled"):
-        parts.append(f"ATR{atr.get('op')}{atr.get('value')}%")
-
-    bh = _to_dict(c.get("break_high"))
-    if bh.get("enabled"):
-        parts.append(f"突破{bh.get('n')}日新高")
-    blw = _to_dict(c.get("break_low"))
-    if blw.get("enabled"):
-        parts.append(f"跌破{blw.get('n')}日新低")
-
-    stk = _to_dict(c.get("streak"))
-    if stk.get("enabled"):
-        d = "涨" if stk.get("direction") == "up" else "跌"
-        parts.append(f"连续{d}{stk.get('op')}{stk.get('days')}天")
-
-    return " | ".join(parts) if parts else "（无条件）"
-
-
 def load_history_detail(history_id):
     try:
-        conn = sqlite3.connect(HISTORY_DB)
+        conn = sqlite3.connect(get_history_db_path())
         df = pd.read_sql_query(
             "SELECT * FROM screening_history WHERE id=?", conn, params=(history_id,))
         conn.close()
@@ -240,7 +166,7 @@ def load_history_detail(history_id):
 
 def delete_history(history_id):
     try:
-        conn = sqlite3.connect(HISTORY_DB)
+        conn = sqlite3.connect(get_history_db_path())
         conn.execute("DELETE FROM screening_history WHERE id=?", (history_id,))
         conn.commit()
         conn.close()
@@ -251,7 +177,7 @@ def delete_history(history_id):
 
 def clear_all_history():
     try:
-        conn = sqlite3.connect(HISTORY_DB)
+        conn = sqlite3.connect(get_history_db_path())
         conn.execute("DELETE FROM screening_history")
         conn.commit()
         conn.close()
@@ -259,14 +185,14 @@ def clear_all_history():
     except Exception:
         return False
 
-
 # ============================================================
-# 自选股管理
+# 自选股管理（用户隔离）
 # ============================================================
 def load_watchlist():
-    if os.path.exists(WATCHLIST_FILE):
+    path = get_watchlist_path()
+    if os.path.exists(path):
         try:
-            with open(WATCHLIST_FILE, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception:
             return []
@@ -274,9 +200,9 @@ def load_watchlist():
 
 
 def save_watchlist(lst):
-    with open(WATCHLIST_FILE, "w", encoding="utf-8") as f:
+    path = get_watchlist_path()
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(lst, f, ensure_ascii=False)
-
 
 # ============================================================
 # 预设策略模板
@@ -287,7 +213,7 @@ PRESET_STRATEGIES = {
         "ui_dk_d_on": True, "ui_dk_d_v": 20.0, "ui_dk_d_op": "<",
         "ui_wkdj_on": True, "ui_wk_k_on": True, "ui_wk_k_v": 30.0, "ui_wk_k_op": "<",
         "ui_rsi_on": True, "ui_rsi_val": 30.0, "ui_rsi_op": "<",
-        "rd_logic": "满足任意一个 (OR)",
+        "rd_logic": "满足任意一个 (AND)",
     },
     "强势突破": {
         "ui_ma_bull": True,
@@ -296,15 +222,41 @@ PRESET_STRATEGIES = {
         "rd_logic": "同时满足全部 (AND)",
     },
     "低吸布局": {
+        # 【修改点】加入了60日均线支撑逻辑
         "fund_on": True,
         "pe_on": True, "pe_max": 20.0,
         "roe_on": True, "roe_min": 15.0,
+        "ui_pma_on": True, "ui_pma_period": 60, "ui_pma_rel": "在均线上方", 
         "rd_logic": "同时满足全部 (AND)",
     },
     "周月共振金叉": {
         "ui_wkdj_on": True, "ui_wk_k_on": True, "ui_wk_k_v": 30.0, "ui_wk_k_op": "<",
         "ui_mkdj_on": True, "ui_mk_k_on": True, "ui_mk_k_v": 40.0, "ui_mk_k_op": "<",
         "ui_kdj_cross_on": True, "ui_kdj_cross_mode": "金叉 (K上穿D)",
+        "rd_logic": "同时满足全部 (AND)",
+    },
+    # ================= 下面是新增的 4 个实战模板 =================
+    "均线回踩 (老鸭头)": {
+        "ui_ma_bull": True,  
+        "ui_pma_on": True, "ui_pma_period": 20, "ui_pma_rel": "在均线上方", 
+        "ui_dev_on": True, "ui_dev_period": 20, "ui_dev_op": "<", "ui_dev_val": 2.0, 
+        "rd_logic": "同时满足全部 (AND)",
+    },
+    "底部放量异动": {
+        "ui_bl_on": True, "ui_bl_n": 60, 
+        "ui_vol_on": True, "ui_vol_mult": 2.0, 
+        "ui_macd_on": True, "ui_macd_mode": "金叉 (DIF上穿DEA)",
+        "rd_logic": "同时满足全部 (AND)",
+    },
+    "多头趋势+MACD金叉": {
+        "ui_pma_on": True, "ui_pma_period": 60, "ui_pma_rel": "在均线上方", 
+        "ui_macd_on": True, "ui_macd_mode": "金叉 (DIF上穿DEA)",
+        "ui_ma_bull": True,
+        "rd_logic": "同时满足全部 (AND)",
+    },
+    "BOLL下轨极度超卖": {
+        "ui_boll_on": True, "ui_boll_mode": "跌破下轨",
+        "ui_dkdj_on": True, "ui_dk_j_on": True, "ui_dk_j_v": 0.0, "ui_dk_j_op": "<", 
         "rd_logic": "同时满足全部 (AND)",
     },
 }
@@ -353,7 +305,6 @@ PERIOD_CODES  = [code  for _, code  in REPORT_PERIOD_OPTIONS]
 from concurrent.futures import ThreadPoolExecutor as _TPE
 import time as _time_mod
 
-# 【修复2】每个指数的理论成分股数量，用于校验数据源是否返回了正确数据
 # 【修复2】每个指数的理论成分股数量，用于校验数据源是否返回了正确数据
 INDEX_EXPECTED_COUNT = {
     "000300": 300,    # 沪深300
@@ -1379,21 +1330,62 @@ def export_to_excel(df):
 # 初始化
 # ============================================================
 init_history_db()
-
 # ============================================================
 # 页面
 # ============================================================
 st.title("📈 股票指标筛选工具")
+
+# 🌟 用户状态初始化
+if "current_user" not in st.session_state:
+    st.session_state["current_user"] = "默认用户"
+
+# 初始化当前用户的数据库
+init_history_db()
 
 INDEX_CODE_MAP = {"沪深300": "000300", "中证A50": "930050",
                   "中证A100": "000903", "中证A500": "000510"}
 
 if "apply_preset" in st.session_state:
     preset = st.session_state.pop("apply_preset")
+    
+    # 先把所有带 ui_ 和 fund_ 的开关全部强制关闭，清空之前的残留
+    for key in list(st.session_state.keys()):
+        if key.startswith("ui_") or key.startswith("fund_") or key.startswith("pe_") or key.startswith("roe_"):
+            if key in ["ui_ma_fast", "ui_ma_slow", "ui_pma_period", "ui_dev_period", 
+                       "ui_dk_k_v", "ui_dk_d_v", "ui_dk_j_v", "ui_wk_k_v", "ui_wk_d_v", "ui_wk_j_v", 
+                       "ui_mk_k_v", "ui_mk_d_v", "ui_mk_j_v", "ui_rsi_period", "ui_rsi_val"]:
+                continue # 跳过数字输入框，只关掉复选框
+            st.session_state[key] = False
+            
+    # 然后再应用新模板的开关
     for k, v in preset.items():
         st.session_state[k] = v
 
 with st.sidebar:
+    # 🌟 在侧边栏的最上方加入用户切换输入框
+    st.header("👤 用户中心")
+    # 👇 新增：多用户必读说明 👇
+    with st.expander("📢 多用户隔离必读说明 (点开看)", expanded=True):
+        st.markdown("""
+        - **💡 原理**：系统通过你输入的**昵称**，为你单独建立一个专属数据文件夹。
+        - **🛡️ 隔离范围**：你的**自选股**、**筛选历史记录**、**回测数据**，与朋友的完全独立，互不干扰。
+        - **🚀 共享提速**：全市场的**K线数据**是全局共享的，不同用户下载过的股票，你也能秒出结果。
+        - **⚠️ 核心警告**：
+          1. **请记住你的专属昵称**，以后每次打开或刷新网页，**都要重新输入一次**（因为网页刷新会重置状态）。
+          2. **不要随便改昵称**，否则你会找不到之前的历史记录。如果真的切错了，把昵称改回去，数据就能重新出来。
+        """)
+    new_user = st.text_input("当前昵称（数据隔离）", value=st.session_state["current_user"], 
+                             help="和朋友共用一个工具时，各自设置不同的昵称，历史记录和自选股将完全独立！")
+    if new_user != st.session_state["current_user"]:
+        if not new_user.strip():
+            st.error("昵称不能为空")
+        else:
+            st.session_state["current_user"] = new_user
+            st.rerun() # 切换用户后立即重载页面
+            
+    st.divider()
+
+    # 下面接着是你原本的代码（不需要动）
     with st.expander("📖 参数说明（强烈建议先看一遍）", expanded=False):
         st.markdown("""
 ### 🎯 通用参数
@@ -1406,38 +1398,46 @@ with st.sidebar:
   - **AND（同时满足）**：条件都要满足，结果少而精。
   - **OR（满足任意一个）**：任一条件满足即可，结果多。
 
+### 🎯 预设策略模板
+- 内置了“超跌反弹、均线回踩、底部放量、周月共振”等经典组合，**点击一键应用，再按需微调数字**即可，能省去大量拼凑条件的时间。
+
 ### 📊 均线类
-- **均线金叉**：短期均线上穿长期均线。
-- **均线多头排列**：MA5 > MA10 > MA20。
+- **均线金叉**：短期均线上穿长期均线（如MA5上穿MA20）。
+- **均线多头排列**：MA5 > MA10 > MA20，典型的强势上涨趋势。
 - **价格/均线关系**：价格在均线上方=强势。
-- **偏离均线幅度**：`(现价 - 均线)/均线 × 100%`。
+- **偏离均线幅度**：`(现价 - 均线)/均线 × 100%`。用于寻找强势股回踩买点。
 
 ### 📉 MACD
 - **金叉/死叉**：DIF 上穿 DEA 为金叉。
-- **柱状线反转**：MACD 柱由负转正。
+- **柱状线反转**：MACD 红绿柱由负转正，代表短期动能反转。
 
 ### 🎯 BOLL 布林带
 由中轨（20日均线）+ 上下轨（±2倍标准差）组成。
+- **跌破下轨**：极度超卖，容易发生报复性反弹。
+- **突破上轨**：极度强势，容易走主升浪。
 
 ### 🔱 KDJ（三种周期）
-- **K < 20**：超卖区；**K > 80**：超买区
+- **K < 20**：超卖区（左侧默认）；（可手动改为 >80 为超买区）。
 - **金叉/死叉**：K 上穿 D 是金叉。
-- **共振**：周K<20 + 日线金叉 = 经典强信号。
+- **共振**：周K<20 + 日线金叉 = 经典强信号（底部反转胜率极高）。
 
 ### 🌡️ RSI 相对强弱
 - **RSI < 30**：超卖；**RSI > 70**：超买。
 
 ### 📦 成交量 / 形态 / ATR
-- **放量倍数**：`今日量 / 5日均量`。
-- **ATR%**：日均波动幅度。
+- **放量倍数**：`今日量 / 5日均量`，>1.5倍属于异动放量。
+- **量价配合**：量增价升=健康多头；量缩价跌=缩量洗盘。
+- **ATR%**：日均真实波动幅度，用来判断股性是否活跃以及设置止损。
 
-### 💰 基本面
-- **PE(TTM)**：0~30 是低估值区间。
-- **ROE**：> 15% 说明赚钱能力强。
-- **缺失数据会被直接过滤掉**（不会自动放行）。
+### 💰 基本面（依托Baostock最新财报）
+- **PE(TTM) / PB**：越低估值越便宜（0~30 为低估值区间）。
+- **ROE**：> 15% 说明赚钱能力强（年化计算）。
+- **净利润 / 营收增速**：判断企业成长性。
+- ⚠️ **注意：勾选了基本面条件，若该股缺失此数据，将被直接过滤掉（防雷）。**
 
-### 🏆 综合评分
-每只命中的股票自动打分，分数越高信号越强。
+### 🏆 综合评分与回测
+- 系统会结合技术面和基本面命中情况，自动给每只股票打出**综合评分**，分数越高信号越强。
+- 主页面下方提供了**业绩数据查询**与**历史筛选回测**，可以复盘策略的胜率和盈亏比。
         """)
 
     st.header("⚙️ 设置")
@@ -1571,21 +1571,21 @@ with st.sidebar:
         dk_k_on = st.checkbox("K 值", value=False, key="ui_dk_k_on", disabled=not dk_on)
         kc1, kc2 = st.columns(2)
         with kc1:
-            dk_k_op = st.selectbox("K条件##dk", [">", "<"], key="ui_dk_k_op", disabled=not dk_k_on)
+            dk_k_op = st.selectbox("K条件##dk", ["<", ">"], key="ui_dk_k_op", disabled=not dk_k_on)
         with kc2:
-            dk_k_v = st.number_input("K阈值##dk", 0.0, 200.0, 80.0, 1.0, key="ui_dk_k_v", disabled=not dk_k_on)
+            dk_k_v = st.number_input("K阈值##dk", 0.0, 200.0, 20.0, 1.0, key="ui_dk_k_v", disabled=not dk_k_on)
         dk_d_on = st.checkbox("D 值", value=False, key="ui_dk_d_on", disabled=not dk_on)
         dc1, dc2 = st.columns(2)
         with dc1:
-            dk_d_op = st.selectbox("D条件##dk", [">", "<"], key="ui_dk_d_op", disabled=not dk_d_on)
+            dk_d_op = st.selectbox("D条件##dk", ["<", ">"], key="ui_dk_d_op", disabled=not dk_d_on)
         with dc2:
             dk_d_v = st.number_input("D阈值##dk", 0.0, 200.0, 20.0, 1.0, key="ui_dk_d_v", disabled=not dk_d_on)
         dk_j_on = st.checkbox("J 值", value=False, key="ui_dk_j_on", disabled=not dk_on)
         jc1, jc2 = st.columns(2)
         with jc1:
-            dk_j_op = st.selectbox("J条件##dk", [">", "<"], key="ui_dk_j_op", disabled=not dk_j_on)
+            dk_j_op = st.selectbox("J条件##dk", ["<", ">"], key="ui_dk_j_op", disabled=not dk_j_on)
         with jc2:
-            dk_j_v = st.number_input("J阈值##dk", -100.0, 200.0, 0.0, 1.0, key="ui_dk_j_v", disabled=not dk_j_on)
+            dk_j_v = st.number_input("J阈值##dk", -100.0, 200.0, 20.0, 1.0, key="ui_dk_j_v", disabled=not dk_j_on)
         kdj_cross_on = st.checkbox("KDJ 金叉/死叉", value=False, key="ui_kdj_cross_on")
         kdj_cross_mode = st.radio("形态##kdjc", ["金叉 (K上穿D)", "死叉 (D上穿K)"], horizontal=True, key="ui_kdj_cross_mode", disabled=not kdj_cross_on)
 
@@ -1594,21 +1594,21 @@ with st.sidebar:
         wk_k_on = st.checkbox("周K值", value=False, key="ui_wk_k_on", disabled=not wk_on)
         wkc1, wkc2 = st.columns(2)
         with wkc1:
-            wk_k_op = st.selectbox("周K条件", [">", "<"], key="ui_wk_k_op", disabled=not wk_k_on)
+            wk_k_op = st.selectbox("周K条件", ["<", ">"], key="ui_wk_k_op", disabled=not wk_k_on)
         with wkc2:
-            wk_k_v = st.number_input("周K阈值", 0.0, 200.0, 80.0, 1.0, key="ui_wk_k_v", disabled=not wk_k_on)
+            wk_k_v = st.number_input("周K阈值", 0.0, 200.0, 20.0, 1.0, key="ui_wk_k_v", disabled=not wk_k_on)
         wk_d_on = st.checkbox("周D值", value=False, key="ui_wk_d_on", disabled=not wk_on)
         wdc1, wdc2 = st.columns(2)
         with wdc1:
-            wk_d_op = st.selectbox("周D条件", [">", "<"], key="ui_wk_d_op", disabled=not wk_d_on)
+            wk_d_op = st.selectbox("周D条件", ["<", ">"], key="ui_wk_d_op", disabled=not wk_d_on)
         with wdc2:
             wk_d_v = st.number_input("周D阈值", 0.0, 200.0, 20.0, 1.0, key="ui_wk_d_v", disabled=not wk_d_on)
         wk_j_on = st.checkbox("周J值", value=False, key="ui_wk_j_on", disabled=not wk_on)
         wjc1, wjc2 = st.columns(2)
         with wjc1:
-            wk_j_op = st.selectbox("周J条件", [">", "<"], key="ui_wk_j_op", disabled=not wk_j_on)
+            wk_j_op = st.selectbox("周J条件", ["<", ">"], key="ui_wk_j_op", disabled=not wk_j_on)
         with wjc2:
-            wk_j_v = st.number_input("周J阈值", -100.0, 200.0, 0.0, 1.0, key="ui_wk_j_v", disabled=not wk_j_on)
+            wk_j_v = st.number_input("周J阈值", -100.0, 200.0, 20.0, 1.0, key="ui_wk_j_v", disabled=not wk_j_on)
 
     with st.expander("🔱 月线 KDJ", expanded=False):
         st.caption("月K数据需≥6个月，建议历史K线天数≥250")
@@ -1616,19 +1616,19 @@ with st.sidebar:
         mk_k_on = st.checkbox("月K值", value=False, key="ui_mk_k_on", disabled=not mk_on)
         mkc1, mkc2 = st.columns(2)
         with mkc1:
-            mk_k_op = st.selectbox("月K条件", [">", "<"], key="ui_mk_k_op", disabled=not mk_k_on)
+            mk_k_op = st.selectbox("月K条件", ["<", ">"], key="ui_mk_k_op", disabled=not mk_k_on)
         with mkc2:
-            mk_k_v = st.number_input("月K阈值", 0.0, 200.0, 40.0, 1.0, key="ui_mk_k_v", disabled=not mk_k_on)
+            mk_k_v = st.number_input("月K阈值", 0.0, 200.0, 20.0, 1.0, key="ui_mk_k_v", disabled=not mk_k_on)
         mk_d_on = st.checkbox("月D值", value=False, key="ui_mk_d_on", disabled=not mk_on)
         mdc1, mdc2 = st.columns(2)
         with mdc1:
-            mk_d_op = st.selectbox("月D条件", [">", "<"], key="ui_mk_d_op", disabled=not mk_d_on)
+            mk_d_op = st.selectbox("月D条件", ["<", ">"], key="ui_mk_d_op", disabled=not mk_d_on)
         with mdc2:
-            mk_d_v = st.number_input("月D阈值", 0.0, 200.0, 40.0, 1.0, key="ui_mk_d_v", disabled=not mk_d_on)
+            mk_d_v = st.number_input("月D阈值", 0.0, 200.0, 20.0, 1.0, key="ui_mk_d_v", disabled=not mk_d_on)
         mk_j_on = st.checkbox("月J值", value=False, key="ui_mk_j_on", disabled=not mk_on)
         mjc1, mjc2 = st.columns(2)
         with mjc1:
-            mk_j_op = st.selectbox("月J条件", [">", "<"], key="ui_mk_j_op", disabled=not mk_j_on)
+            mk_j_op = st.selectbox("月J条件", ["<", ">"], key="ui_mk_j_op", disabled=not mk_j_on)
         with mjc2:
             mk_j_v = st.number_input("月J阈值", -100.0, 200.0, 20.0, 1.0, key="ui_mk_j_v", disabled=not mk_j_on)
 
@@ -2066,35 +2066,45 @@ if "last_results" in st.session_state:
                     selected_rows = sel.selection.get("rows", []) if isinstance(sel.selection, dict) else sel.selection.rows
             except Exception:
                 selected_rows = []
+                
             if selected_rows:
                 row_idx = selected_rows[0]
-                sc = str(df_display.iloc[row_idx]["代码"]).zfill(6)
-                sn = df_display.iloc[row_idx]["名称"]
-                st.markdown(f"### 📌 {sc} {sn}")
-                detail_df, _ = load_or_update_kline(sc, days=min(history_days, 250))
-                if detail_df is not None and len(detail_df) > 20:
-                    chart_df = detail_df.set_index("date")[["close"]].copy()
-                    chart_df.columns = ["收盘价"]
-                    st.line_chart(chart_df, height=200)
-                    try:
-                        ddf = wrap(detail_df.copy())
-                        _ = ddf.get("kdj"); _ = ddf.get("macd"); _ = ddf.get("atr")
-                        m1 = st.columns(3)
-                        m1[0].metric("最新价", round(detail_df["close"].iloc[-1], 2))
-                        m1[1].metric("日K", round(ddf["kdjk"].iloc[-1], 2))
-                        m1[2].metric("日D", round(ddf["kdjd"].iloc[-1], 2))
-                        m2 = st.columns(3)
-                        m2[0].metric("日J", round(ddf["kdjj"].iloc[-1], 2))
-                        m2[1].metric("MACD", round(ddf["macd"].iloc[-1], 3))
-                        m2[2].metric("ATR%", round(ddf["atr"].iloc[-1] / detail_df["close"].iloc[-1] * 100, 2))
-                    except Exception:
-                        pass
-                    recent = detail_df.tail(5)[["date", "open", "high", "low", "close", "volume"]].copy()
-                    recent["date"] = recent["date"].dt.strftime("%Y-%m-%d")
-                    recent.columns = ["日期", "开盘", "最高", "最低", "收盘", "成交量"]
-                    st.dataframe(recent, use_container_width=True, hide_index=True)
+                # 💡 边界判断
+                if 0 <= row_idx < len(df_display):
+                    sc = str(df_display.iloc[row_idx]["代码"]).zfill(6)
+                    sn = df_display.iloc[row_idx]["名称"]
+                    st.markdown(f"### 📌 {sc} {sn}")
+                    
+                    # --- 下面是你原本的展示详情代码，请确保完整保留 ---
+                    detail_df, _ = load_or_update_kline(sc, days=min(history_days, 250))
+                    if detail_df is not None and len(detail_df) > 20:
+                        chart_df = detail_df.set_index("date")[["close"]].copy()
+                        chart_df.columns = ["收盘价"]
+                        st.line_chart(chart_df, height=200)
+                        try:
+                            ddf = wrap(detail_df.copy())
+                            _ = ddf.get("kdj"); _ = ddf.get("macd"); _ = ddf.get("atr")
+                            m1 = st.columns(3)
+                            m1[0].metric("最新价", round(detail_df["close"].iloc[-1], 2))
+                            m1[1].metric("日K", round(ddf["kdjk"].iloc[-1], 2))
+                            m1[2].metric("日D", round(ddf["kdjd"].iloc[-1], 2))
+                            m2 = st.columns(3)
+                            m2[0].metric("日J", round(ddf["kdjj"].iloc[-1], 2))
+                            m2[1].metric("MACD", round(ddf["macd"].iloc[-1], 3))
+                            m2[2].metric("ATR%", round(ddf["atr"].iloc[-1] / detail_df["close"].iloc[-1] * 100, 2))
+                        except Exception:
+                            pass
+                        recent = detail_df.tail(5)[["date", "open", "high", "low", "close", "volume"]].copy()
+                        recent["date"] = recent["date"].dt.strftime("%Y-%m-%d")
+                        recent.columns = ["日期", "开盘", "最高", "最低", "收盘", "成交量"]
+                        st.dataframe(recent, use_container_width=True, hide_index=True)
+                    else:
+                        st.warning("无法加载K线数据。")
+                    # --- 原本的代码结束 ---
+                    
                 else:
-                    st.warning("无法加载K线数据。")
+                    # 如果越界了（即上面说的筛选后行数变少的情况）
+                    st.info("👈 筛选结果已更新，请重新点击左侧表格行查看详情。")
             else:
                 st.info("👈 点击左侧表格行查看详情。")
     else:
@@ -2375,6 +2385,9 @@ if st.button("🔍 查询业绩数据（预告+快报+报表）", key="fc_run", 
                     if not nums:
                         return change_str
                     formatted_nums = [f"{float(n):.2f}" for n in nums[:2]]
+                    if len(formatted_nums) == 2:
+                        nums_float = sorted([float(formatted_nums[0]), float(formatted_nums[1])])
+                        formatted_nums = [f"{nums_float[0]:.2f}", f"{nums_float[1]:.2f}"]
                     if len(formatted_nums) == 2:
                         res = f"{formatted_nums[0]}% ~ {formatted_nums[1]}%"
                     elif len(formatted_nums) == 1:
