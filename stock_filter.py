@@ -111,12 +111,18 @@ def init_history_db():
             logic_mode TEXT,
             conditions TEXT,
             result_count INTEGER,
-            results_json TEXT
+            results_json TEXT,
+            is_backtested INTEGER DEFAULT 0  -- 🌟 新增：是否回测过标记
         )
     """)
+    # 🌟 兼容老用户：如果旧表没有这个字段，自动加上
+    try:
+        conn.execute("ALTER TABLE screening_history ADD COLUMN is_backtested INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass # 字段已存在，忽略报错
+        
     conn.commit()
     conn.close()
-
 
 def save_history(index_name, logic_mode, conditions, results):
     try:
@@ -136,8 +142,9 @@ def save_history(index_name, logic_mode, conditions, results):
 def load_history(limit=30):
     try:
         conn = sqlite3.connect(get_history_db_path())
+        # 🌟 修改了这里的 SELECT 语句
         df = pd.read_sql_query(
-            f"SELECT id, run_time, index_name, logic_mode, conditions, result_count FROM screening_history ORDER BY id DESC LIMIT {limit}",
+            f"SELECT id, run_time, index_name, logic_mode, conditions, result_count, is_backtested FROM screening_history ORDER BY id DESC LIMIT {limit}",
             conn)
         conn.close()
         return df
@@ -162,7 +169,93 @@ def load_history_detail(history_id):
         }
     except Exception:
         return None
+def _to_dict(v):
+    """如果 v 是字符串形式的 dict，尝试解析成 dict；否则原样返回"""
+    if isinstance(v, dict):
+        return v
+    if isinstance(v, str):
+        try:
+            import ast
+            parsed = ast.literal_eval(v)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+    return {}
 
+
+def summarize_conditions(conditions_json):
+    """把保存的 conditions JSON 转成简短摘要文字（兼容旧数据的字符串嵌套）"""
+    try:
+        c = json.loads(conditions_json) if isinstance(conditions_json, str) else conditions_json
+    except Exception:
+        return ""
+    if not isinstance(c, dict):
+        return ""
+    parts = []
+
+    ma = _to_dict(c.get("ma_golden"))
+    if ma.get("enabled"):
+        parts.append(f"MA{ma.get('fast')}↑{ma.get('slow')}")
+    if _to_dict(c.get("ma_bull")).get("enabled"):
+        parts.append("MA多头")
+    pma = _to_dict(c.get("price_vs_ma"))
+    if pma.get("enabled"):
+        parts.append(f"价格{'>' if pma.get('relation')=='above' else '<'}MA{pma.get('period')}")
+    dev = _to_dict(c.get("ma_deviation"))
+    if dev.get("enabled"):
+        parts.append(f"偏离MA{dev.get('period')}{dev.get('op')}{dev.get('value')}%")
+
+    mc = _to_dict(c.get("macd_cross"))
+    if mc.get("enabled"):
+        parts.append("MACD" + ("金叉" if mc.get("mode") == "golden" else "死叉"))
+    mh = _to_dict(c.get("macd_hist"))
+    if mh.get("enabled"):
+        parts.append("MACD柱" + ("由负转正" if mh.get("mode") == "turn_pos" else "由正转负"))
+
+    bl = _to_dict(c.get("boll"))
+    if bl.get("enabled"):
+        parts.append(f"BOLL:{bl.get('mode')}")
+
+    for period_key, label in [("kdj_daily", "日"), ("kdj_weekly", "周"), ("kdj_monthly", "月")]:
+        kk = _to_dict(c.get(period_key))
+        for k in ["K", "D", "J"]:
+            sub = _to_dict(kk.get(k))
+            if sub.get("enabled"):
+                parts.append(f"{label}{k}{sub.get('op')}{sub.get('value')}")
+
+    kc = _to_dict(c.get("kdj_cross"))
+    if kc.get("enabled"):
+        parts.append("KDJ" + ("金叉" if kc.get("mode") == "golden" else "死叉"))
+
+    rsi = _to_dict(c.get("rsi"))
+    if rsi.get("enabled"):
+        parts.append(f"RSI{rsi.get('period')}{rsi.get('op')}{rsi.get('value')}")
+
+    vol = _to_dict(c.get("volume"))
+    if vol.get("enabled"):
+        parts.append(f"放量{vol.get('multiple')}倍")
+    vp = _to_dict(c.get("vol_price"))
+    if vp.get("enabled"):
+        parts.append("量增价升" if vp.get("mode") == "up" else "量缩价跌")
+
+    atr = _to_dict(c.get("atr"))
+    if atr.get("enabled"):
+        parts.append(f"ATR{atr.get('op')}{atr.get('value')}%")
+
+    bh = _to_dict(c.get("break_high"))
+    if bh.get("enabled"):
+        parts.append(f"突破{bh.get('n')}日新高")
+    blw = _to_dict(c.get("break_low"))
+    if blw.get("enabled"):
+        parts.append(f"跌破{blw.get('n')}日新低")
+
+    stk = _to_dict(c.get("streak"))
+    if stk.get("enabled"):
+        d = "涨" if stk.get("direction") == "up" else "跌"
+        parts.append(f"连续{d}{stk.get('op')}{stk.get('days')}天")
+
+    return " | ".join(parts) if parts else "（无条件）"
 
 def delete_history(history_id):
     try:
@@ -1365,7 +1458,7 @@ with st.sidebar:
     # 🌟 在侧边栏的最上方加入用户切换输入框
     st.header("👤 用户中心")
     # 👇 新增：多用户必读说明 👇
-    with st.expander("📢 多用户隔离必读说明 (点开看)", expanded=True):
+    with st.expander("📢 多用户隔离必读说明 (点开看)", expanded=False):
         st.markdown("""
         - **💡 原理**：系统通过你输入的**昵称**，为你单独建立一个专属数据文件夹。
         - **🛡️ 隔离范围**：你的**自选股**、**筛选历史记录**、**回测数据**，与朋友的完全独立，互不干扰。
@@ -1708,7 +1801,9 @@ else:
     st.caption(f"筛选逻辑：{logic_mode}")
 
 st.divider()
-start_button = st.button("🚀 开始筛选", type="primary", use_container_width=True)
+start_button = st.button("🚀 开始筛选", type="primary", width="stretch"
+
+)
 
 
 # ============================================================
@@ -1899,7 +1994,9 @@ if start_button:
         st.info(f"第二阶段完成：基本面通过 **{len(fund_pass)}** 只（被拒 {len(rejected_fund)} 只）")
         if rejected_fund:
             with st.expander(f"🔎 查看被基本面拒掉的 {len(rejected_fund)} 只（含拒因）", expanded=False):
-                st.dataframe(pd.DataFrame(rejected_fund), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(rejected_fund), width="stretch"
+
+, hide_index=True)
         final_results = fund_pass
     else:
         final_results = tech_passed
@@ -1993,7 +2090,9 @@ if "last_results" in st.session_state:
             st.download_button(
                 "📥 下载 CSV", data=csv_data,
                 file_name=f"筛选结果_{index_name_display}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-                mime="text/csv", use_container_width=True,
+                mime="text/csv", width="stretch"
+
+,
             )
         with exp2:
             if HAS_OPENPYXL:
@@ -2002,7 +2101,9 @@ if "last_results" in st.session_state:
                     "📊 下载 Excel（带格式）", data=xlsx_data,
                     file_name=f"筛选结果_{index_name_display}_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True,
+                    width="stretch"
+
+,
                 )
             else:
                 st.caption("安装 openpyxl 后可导出 Excel")
@@ -2036,7 +2137,9 @@ if "last_results" in st.session_state:
         with col_left:
             sel = st.dataframe(
                 df_display,
-                use_container_width=True,
+                width="stretch"
+
+,
                 height=520,
                 on_select="rerun",
                 selection_mode="single-row",
@@ -2097,7 +2200,9 @@ if "last_results" in st.session_state:
                         recent = detail_df.tail(5)[["date", "open", "high", "low", "close", "volume"]].copy()
                         recent["date"] = recent["date"].dt.strftime("%Y-%m-%d")
                         recent.columns = ["日期", "开盘", "最高", "最低", "收盘", "成交量"]
-                        st.dataframe(recent, use_container_width=True, hide_index=True)
+                        st.dataframe(recent, width="stretch"
+
+, hide_index=True)
                     else:
                         st.warning("无法加载K线数据。")
                     # --- 原本的代码结束 ---
@@ -2111,7 +2216,9 @@ if "last_results" in st.session_state:
         st.warning("⚠️ 没有股票满足条件。")
         if all_scanned:
             st.subheader("📊 已扫描快照（前20只）")
-            st.dataframe(pd.DataFrame(all_scanned).head(20), use_container_width=True)
+            st.dataframe(pd.DataFrame(all_scanned).head(20), width="stretch"
+
+)
 
 # ============================================================
 # 历史筛选记录
@@ -2125,15 +2232,27 @@ if hist_df.empty:
 else:
     hist_display = hist_df.copy()
     hist_display["条件摘要"] = hist_display["conditions"].apply(summarize_conditions)
+    
+    # 🌟 1. 生成回测状态列（如果在数据库里是 1，就显示带绿勾的已回测）
+    if "is_backtested" in hist_display.columns:
+        hist_display["回测状态"] = hist_display["is_backtested"].apply(lambda x: "✅ 已回测" if x == 1 else "未回测")
+    else:
+        hist_display["回测状态"] = "未回测"
+        
     hist_display = hist_display.rename(columns={
         "id": "ID", "run_time": "时间", "index_name": "股票池",
         "logic_mode": "逻辑", "result_count": "结果数",
     })
-    hist_display = hist_display[["ID", "时间", "股票池", "逻辑", "结果数", "条件摘要"]]
+    
+    # 🌟 2. 把“回测状态”加入显示的列序列中
+    hist_display = hist_display[["ID", "时间", "股票池", "逻辑", "结果数", "回测状态", "条件摘要"]]
 
+    # 🌟 3. 渲染表格（加入回测状态的列配置）
     st.dataframe(
         hist_display,
-        use_container_width=True,
+        width="stretch"
+
+,
         hide_index=True,
         column_config={
             "ID": st.column_config.NumberColumn("ID", width="small", format="%d"),
@@ -2141,35 +2260,54 @@ else:
             "股票池": st.column_config.TextColumn("股票池", width="small"),
             "逻辑": st.column_config.TextColumn("逻辑", width="small"),
             "结果数": st.column_config.NumberColumn("结果数", width="small"),
+            "回测状态": st.column_config.TextColumn("回测状态", width="small"), # 👈 新增这一行
             "条件摘要": st.column_config.TextColumn("条件摘要", width="large"),
         },
     )
-
     del_col1, del_col2, del_col3 = st.columns([2, 1, 1])
     with del_col1:
         del_options = ["不删除"] + [
-            f"#{r['id']} - {r['run_time']} ({r['index_name']}, {r['result_count']}只)"
-            for _, r in hist_df.iterrows()
-        ]
+        # 🌟 如果回测过，加上【⚠️已回测】提示
+        f"#{r['id']} - {r['run_time']} ({r['index_name']}, {r['result_count']}只) {'【⚠️已回测】' if r.get('is_backtested') == 1 else ''}"
+        for _, r in hist_df.iterrows()
+    ]
         del_target = st.selectbox("选择要删除的记录", del_options, key="del_hist_sel")
     with del_col2:
         st.write("")
         st.write("")
-        if st.button("🗑️ 删除选中", key="btn_del_one", use_container_width=True):
+        if st.button("🗑️ 删除选中", key="btn_del_one", width="stretch"
+
+):
             if del_target != "不删除":
-                try:
-                    hid = int(del_target.split(" ")[0].replace("#", ""))
-                    if delete_history(hid):
-                        st.success(f"已删除记录 #{hid}")
-                        st.rerun()
-                    else:
-                        st.error("删除失败，请重试。")
-                except Exception as e:
-                    st.error(f"删除出错：{e}")
+                # 🌟 检查是否包含已回测的提示词
+                if "【⚠️已回测】" in del_target:
+                    st.error("⚠️ 你选择删除的是一条【已回测】数据！请再次确认是否真的要删除。")
+                    # 用 checkbox 强制二次确认
+                    if st.checkbox("我确定要删除这条回测记录", key="confirm_del_bt"):
+                        try:
+                            hid = int(del_target.split(" ")[0].replace("#", ""))
+                            if delete_history(hid):
+                                st.success(f"已删除记录 #{hid}")
+                                st.rerun()
+                        except Exception as e:
+                            st.error(f"删除出错：{e}")
+                else:
+                    # 正常删除
+                    try:
+                        hid = int(del_target.split(" ")[0].replace("#", ""))
+                        if delete_history(hid):
+                            st.success(f"已删除记录 #{hid}")
+                            st.rerun()
+                        else:
+                            st.error("删除失败，请重试。")
+                    except Exception as e:
+                        st.error(f"删除出错：{e}")
     with del_col3:
         st.write("")
         st.write("")
-        if st.button("⚠️ 清空全部", key="btn_del_all", use_container_width=True):
+        if st.button("⚠️ 清空全部", key="btn_del_all", width="stretch"
+
+):
             if clear_all_history():
                 st.success("已清空全部历史记录")
                 st.rerun()
@@ -2230,7 +2368,9 @@ else:
 
                 st.dataframe(
                     hdf,
-                    use_container_width=True,
+                    width="stretch"
+
+,
                     height=400,
                     column_config={
                         "综合评分": st.column_config.ProgressColumn(
@@ -2411,7 +2551,9 @@ if st.button("🔍 查询业绩数据（预告+快报+报表）", key="fc_run", 
                 # ================= 6. 渲染表格 =================
                 st.dataframe(
                     display,
-                    use_container_width=True,
+                    width="stretch"
+
+,
                     hide_index=True,
                     height=550,
                     column_config={
@@ -2496,7 +2638,7 @@ if bt_hist_df.empty:
     st.info("暂无历史筛选记录。请先执行至少一次筛选。")
 else:
     options = ["不选择"] + [
-        f"#{r['id']} - {r['run_time']} | {r['index_name']} | {r['result_count']}只"
+        f"#{r['id']} - {r['run_time']} | {r['index_name']} | {r['result_count']}只 {'✅ 已回测' if r.get('is_backtested') == 1 else ''}"
         for _, r in bt_hist_df.iterrows()
         if r["result_count"] > 0
     ]
@@ -2516,7 +2658,9 @@ else:
         with bc2:
             st.write("")
             st.write("")
-            run_bt = st.button("🚀 执行回测", type="primary", key="bt_run", use_container_width=True)
+            run_bt = st.button("🚀 执行回测", type="primary", key="bt_run", width="stretch"
+
+)
 
         if run_bt and sel_hist != "不选择":
             try:
@@ -2612,6 +2756,15 @@ else:
                     st.warning("没有可回测的数据。")
                 else:
                     bt_df = pd.DataFrame(bt_rows)
+                # ====== 新增：标记该历史记录已被回测 ======
+                try:
+                    conn = sqlite3.connect(get_history_db_path())
+                    conn.execute("UPDATE screening_history SET is_backtested = 1 WHERE id = ?", (hid,))
+                    conn.commit()
+                    conn.close()
+                except Exception:
+                    pass
+                # ==========================================
 
                     st.markdown("### 📊 汇总统计")
                     stats = []
@@ -2649,7 +2802,9 @@ else:
                         stats_df = pd.DataFrame(stats)
                         st.dataframe(
                             stats_df,
-                            use_container_width=True,
+                            width="stretch"
+
+,
                             hide_index=True,
                             column_config={
                                 "持有期": st.column_config.TextColumn("持有期", width="small"),
@@ -2675,7 +2830,9 @@ else:
                     show_cols = [c for c in show_cols if c in bt_df.columns]
                     bt_display = bt_df[show_cols].sort_values("综合评分", ascending=False)
 
-                    st.dataframe(bt_display, use_container_width=True, height=420)
+                    st.dataframe(bt_display, width="stretch"
+
+, height=420)
 
                     csv_bt = bt_df.to_csv(index=False, encoding="utf-8-sig")
                     st.download_button(
