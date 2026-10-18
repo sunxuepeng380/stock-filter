@@ -404,11 +404,12 @@ INDEX_EXPECTED_COUNT = {
     "930050": 50,     # 中证A50
     "000903": 100,    # 中证A100
     "000510": 500,    # 中证A500
+    "000852": 1000,   # 中证1000
 }
 
 # 【补丁A】新浪 index_stock_cons 对这几个 2024 年后新发布的指数不收录，
 # 一旦 fallback 会返回全市场/错误页面数据，因此直接跳过新浪源
-SINA_UNSUPPORTED = {"930050", "000903", "000510"}
+SINA_UNSUPPORTED = {"930050", "000903", "000510", "000852"}
 
 
 def _fetch_with_timeout(func, timeout=8):
@@ -1436,7 +1437,8 @@ if "current_user" not in st.session_state:
 init_history_db()
 
 INDEX_CODE_MAP = {"沪深300": "000300", "中证A50": "930050",
-                  "中证A100": "000903", "中证A500": "000510"}
+                  "中证A100": "000903", "中证A500": "000510",
+                  "中证1000": "000852"}
 
 if "apply_preset" in st.session_state:
     preset = st.session_state.pop("apply_preset")
@@ -1462,7 +1464,7 @@ with st.sidebar:
         st.markdown("""
         - **💡 原理**：系统通过你输入的**昵称**，为你单独建立一个专属数据文件夹。
         - **🛡️ 隔离范围**：你的**自选股**、**筛选历史记录**、**回测数据**，与其他用户的完全独立，互不干扰。
-        - **🚀 共享提速**：全市场的**K线数据**是全局共享的，不同用户下载过的股票，你也能秒出结果。
+        - **🚀 共享提速**：全市场的**K线数据**是全局共享的，其他用户下载过的股票，你也能秒出结果。
         - **⚠️ 核心警告**：
           1. **请记住你的专属昵称**，以后每次打开或刷新网页，**都要重新输入一次**（因为网页刷新会重置状态）。
           2. **不要随便改昵称**，否则你会找不到之前的历史记录。如果真的切错了，把昵称改回去，数据就能重新出来。
@@ -2267,32 +2269,22 @@ else:
     del_col1, del_col2, del_col3 = st.columns([2, 1, 1])
     with del_col1:
         del_options = ["不删除"] + [
-        # 🌟 如果回测过，加上【⚠️已回测】提示
-        f"#{r['id']} - {r['run_time']} ({r['index_name']}, {r['result_count']}只) {'【⚠️已回测】' if r.get('is_backtested') == 1 else ''}"
-        for _, r in hist_df.iterrows()
-    ]
+            f"#{r['id']} - {r['run_time']} ({r['index_name']}, {r['result_count']}只) {'【⚠️已回测】' if r.get('is_backtested') == 1 else ''}"
+            for _, r in hist_df.iterrows()
+        ]
         del_target = st.selectbox("选择要删除的记录", del_options, key="del_hist_sel")
+        
     with del_col2:
         st.write("")
         st.write("")
-        if st.button("🗑️ 删除选中", key="btn_del_one", width="stretch"
-
-):
+        if st.button("🗑️ 删除选中", key="btn_del_one", width="stretch"):
             if del_target != "不删除":
-                # 🌟 检查是否包含已回测的提示词
+                # 如果是已回测的数据，把目标存入 session_state 等待确认
                 if "【⚠️已回测】" in del_target:
-                    st.error("⚠️ 你选择删除的是一条【已回测】数据！请再次确认是否真的要删除。")
-                    # 用 checkbox 强制二次确认
-                    if st.checkbox("我确定要删除这条回测记录", key="confirm_del_bt"):
-                        try:
-                            hid = int(del_target.split(" ")[0].replace("#", ""))
-                            if delete_history(hid):
-                                st.success(f"已删除记录 #{hid}")
-                                st.rerun()
-                        except Exception as e:
-                            st.error(f"删除出错：{e}")
+                    st.session_state["pending_delete_target"] = del_target
+                    st.rerun()
                 else:
-                    # 正常删除
+                    # 非回测数据，直接删
                     try:
                         hid = int(del_target.split(" ")[0].replace("#", ""))
                         if delete_history(hid):
@@ -2302,17 +2294,41 @@ else:
                             st.error("删除失败，请重试。")
                     except Exception as e:
                         st.error(f"删除出错：{e}")
+                        
     with del_col3:
         st.write("")
         st.write("")
-        if st.button("⚠️ 清空全部", key="btn_del_all", width="stretch"
-
-):
+        if st.button("⚠️ 清空全部", key="btn_del_all", width="stretch"):
             if clear_all_history():
                 st.success("已清空全部历史记录")
                 st.rerun()
             else:
                 st.error("清空失败，请重试。")
+
+    # 🌟 分离出来的二次确认逻辑
+    if "pending_delete_target" in st.session_state:
+        target = st.session_state["pending_delete_target"]
+        st.error(f"⚠️ 警告：你选择删除的是一条【已回测】数据，删除后将无法找回回测明细！")
+        
+        confirm_col1, confirm_col2 = st.columns([1, 4])
+        with confirm_col1:
+            if st.button("确认删除", type="primary", key="btn_confirm_del_bt", width="stretch"):
+                try:
+                    hid = int(target.split(" ")[0].replace("#", ""))
+                    if delete_history(hid):
+                        st.success(f"已彻底删除记录 #{hid}")
+                        del st.session_state["pending_delete_target"] # 清除状态
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"删除出错：{e}")
+        with confirm_col2:
+            if st.button("取消", key="btn_cancel_del_bt", width="stretch"):
+                del st.session_state["pending_delete_target"] # 清除状态
+                st.rerun()
+
+    # ==========================================
+    # 以下是你的【查看某次详情】逻辑，原封不动保留
+    # ==========================================
     hist_id = st.selectbox(
         "查看某次详情",
         ["不查看"] + [
@@ -2368,9 +2384,7 @@ else:
 
                 st.dataframe(
                     hdf,
-                    width="stretch"
-
-,
+                    width="stretch",
                     height=400,
                     column_config={
                         "综合评分": st.column_config.ProgressColumn(
