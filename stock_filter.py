@@ -1102,6 +1102,7 @@ def check_stock(kline_df, conds):
     snapshot = {
         "最新价": round(df["close"].iloc[-1], 2),
         "涨跌幅(%)": round((df["close"].iloc[-1] / df["close"].iloc[-2] - 1) * 100, 2),
+        "数据日期": kline_df["date"].iloc[-1].strftime("%Y-%m-%d"), 
     }
 
     c = conds.get("ma_golden", {})
@@ -1369,6 +1370,14 @@ def process_one_stock(code, name, history_days, conditions, use_and, skip_st, su
     kline, err = load_or_update_kline(code, days=history_days)
     if kline is None or len(kline) < 60:
         return {"status": "failed", "code": code, "name": name, "error": err or "数据不足60天"}
+    last_date = pd.to_datetime(kline["date"].iloc[-1]).normalize()
+    today = pd.Timestamp.today().normalize()
+    trade_dates = _get_trade_dates()
+    if trade_dates:
+        past_td = [d for d in trade_dates if d <= today]
+        latest_td = max(past_td) if past_td else today
+        if last_date < latest_td:
+            return {"status": "failed", "code": code, "name": name, "error": f"数据未更新到最新({last_date.date()})，已跳过"}
     hits, enabled_count, snap = check_stock(kline, conditions)
 
     # 没勾任何技术条件 → 全部放行，交给基本面阶段
@@ -2073,7 +2082,7 @@ if "last_results" in st.session_state:
         df = pd.DataFrame(final_results)
 
         # ---- 动态生成列清单 ----
-        col_order = ["代码", "名称", "综合评分", "最新价", "涨跌幅(%)"]
+        col_order = ["代码", "名称", "综合评分", "数据日期", "最新价", "涨跌幅(%)"]
 
         # 基本面列：仅当勾选了对应条件时才显示
         if fund_on and pe_on:      col_order.append("PE")
@@ -2689,11 +2698,16 @@ else:
                 "1,5,10,20,40",
                 key="bt_hold",
             )
+            # 🌟 新增：如果选了带绿色勾勾的记录，加一行友好提示
+            if "✅ 已回测" in sel_hist:
+                st.info("💡 你选择了一条历史回测记录。点击右侧按钮将基于最新的 K 线数据为你重新计算并展示详细的收益明细。")
+                
         with bc2:
             st.write("")
             st.write("")
-            run_bt = st.button("🚀 执行回测", type="primary", key="bt_run", width="stretch"
-
+            # 🌟 修改：根据是否已回测，动态改变按钮的文字
+            btn_text = "🔄 查看 / 重算回测" if "✅ 已回测" in sel_hist else "🚀 执行首次回测"
+            run_bt = st.button(btn_text, type="primary", key="bt_run", width="stretch"
 )
 
         if run_bt and sel_hist != "不选择":
