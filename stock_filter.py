@@ -1590,17 +1590,31 @@ with st.sidebar:
             st.info(f"本地已缓存 {st.session_state['cache_count']} 只")
         if "cache_msg" in st.session_state:
             st.success(st.session_state["cache_msg"])
-        # 【修复2】成分股缓存单独清理入口
-        if st.button("🧹 清空成分股缓存（出现股票池异常时点此）", key="btn_clear_components"):
-            removed = 0
-            for f in os.listdir("data"):
-                if f.startswith("components_") and f.endswith(".csv"):
-                    try:
-                        os.remove(os.path.join("data", f))
-                        removed += 1
-                    except Exception:
-                        pass
-            st.success(f"已清空 {removed} 个成分股缓存，请重新筛选。")
+        # 【修复】成分股缓存单独清理入口，加入二次确认
+        if st.button("🧹 清空成分股缓存（出现股票池异常时点此）", key="btn_clear_components", width="stretch"):
+            st.session_state["confirm_clear_comp"] = True
+            st.rerun()
+
+        if st.session_state.get("confirm_clear_comp", False):
+            st.warning("⚠️ 确定要清空所有成分股缓存吗？下次筛选将强制重新从网络获取最新名单，可能会较慢。")
+            cc1, cc2 = st.columns(2)
+            with cc1:
+                if st.button("✅ 确认清空", type="primary", key="btn_confirm_clear_comp", width="stretch"):
+                    removed = 0
+                    for f in os.listdir("data"):
+                        if f.startswith("components_") and f.endswith(".csv"):
+                            try:
+                                os.remove(os.path.join("data", f))
+                                removed += 1
+                            except Exception:
+                                pass
+                    st.session_state["confirm_clear_comp"] = False # 清除状态
+                    st.success(f"已清空 {removed} 个成分股缓存，请重新筛选。")
+                    st.rerun()
+            with cc2:
+                if st.button("取消", key="btn_cancel_clear_comp", width="stretch"):
+                    st.session_state["confirm_clear_comp"] = False # 清除状态
+                    st.rerun()
 
     with st.expander("💰 基本面筛选", expanded=False):
         fund_on = st.checkbox("启用基本面筛选", value=False, key="fund_on")
@@ -1887,7 +1901,6 @@ if start_button:
     failed = 0
     skipped = 0
     fail_reasons = {}
-
     if use_concurrent:
         st.info(f"并发模式：{num_workers} 线程")
         rows = list(comp_df.iterrows())
@@ -1897,7 +1910,10 @@ if start_button:
                        for _, row in rows}
             for i, fut in enumerate(as_completed(futures)):
                 res = fut.result()
-                progress_bar.progress((i + 1) / len(rows), text=f"进度 {i+1}/{len(rows)}")
+                # 🌟 优化：每处理 10 个或者到最后一个时，才刷新一次进度条，防止前端卡死
+                if (i + 1) % 10 == 0 or (i + 1) == len(rows):
+                    progress_bar.progress((i + 1) / len(rows), text=f"进度 {i+1}/{len(rows)}")
+                
                 if res["status"] == "skipped":
                     skipped += 1
                 elif res["status"] == "failed":
@@ -1911,8 +1927,12 @@ if start_button:
     else:
         for i, row in comp_df.iterrows():
             code, name = row["code"], row["name"]
-            status_text.text(f"处理 [{i+1}/{len(comp_df)}] {code} {name}")
-            progress_bar.progress((i + 1) / len(comp_df), text=f"进度 {i+1}/{len(comp_df)} — {code} {name}")
+            
+            # 🌟 优化：每处理 10 个或者到最后一个时，才刷新一次进度条
+            if (i + 1) % 10 == 0 or (i + 1) == len(comp_df):
+                status_text.text(f"处理 [{i+1}/{len(comp_df)}] {code} {name}")
+                progress_bar.progress((i + 1) / len(comp_df), text=f"进度 {i+1}/{len(comp_df)} — {code} {name}")
+                
             res = process_one_stock(code, name, history_days, conditions, use_and, skip_st, suspended_set)
             if res["status"] == "skipped":
                 skipped += 1
