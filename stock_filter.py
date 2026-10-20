@@ -2801,20 +2801,26 @@ else:
                 progress.empty()
 
                 if not bt_rows:
-                    st.warning("没有可回测的数据。")
+                    st.warning("⚠️ 没有可回测的数据。可能原因：1. 基准日太新，暂无未来K线；2. 股票停牌或退市。")
                 else:
                     bt_df = pd.DataFrame(bt_rows)
-                # ====== 新增：标记该历史记录已被回测 ======
-                try:
-                    conn = sqlite3.connect(get_history_db_path())
-                    conn.execute("UPDATE screening_history SET is_backtested = 1 WHERE id = ?", (hid,))
-                    conn.commit()
-                    conn.close()
-                except Exception:
-                    pass
-                # ==========================================
+                    
+                    # ====== 新增：标记该历史记录已被回测 ======
+                    try:
+                        conn = sqlite3.connect(get_history_db_path())
+                        conn.execute("UPDATE screening_history SET is_backtested = 1 WHERE id = ?", (hid,))
+                        conn.commit()
+                        conn.close()
+                    except Exception:
+                        pass
+                    # ==========================================
 
-                    st.markdown("### 📊 汇总统计")
+                    # 🌟 关键修复：如果发现所有行都是空的（说明没有未来数据），提示用户
+                    if bt_df[f"{hold_days[0]}日毛收益%"].dropna().empty:
+                        st.error("🚨 回测失败：所有的收益率均为空。请检查你的【回测基准日】是否晚于当前真实日期！")
+                    else:
+                        st.markdown("### 📊 汇总统计")
+                # ==========================================
                     stats = []
                     for n in hold_days:
                         col = f"{n}日净收益%"
