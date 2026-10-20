@@ -616,14 +616,27 @@ def fetch_kline_from_network(stock_code, days=200):
 # ============================================================
 # 交易日历 & 除权检测辅助函数
 # ============================================================
+# 🌟 优化1：直接返回最新的交易日，不再返回巨大的日历 set
 @st.cache_data(ttl=86400, show_spinner=False)
-def _get_trade_dates():
+def get_latest_trade_date():
     try:
         df = ak.tool_trade_date_hist_sina()
-        return set(pd.to_datetime(df["trade_date"]).dt.normalize())
+        tdates = pd.to_datetime(df["trade_date"]).dt.normalize()
+        today = pd.Timestamp.today().normalize()
+        past_dates = tdates[tdates <= today]
+        return past_dates.max() if not past_dates.empty else today
+    except Exception:
+        return pd.Timestamp.today().normalize()
+
+# 🌟 优化2：利用文件的修改时间(mtime)作为缓存键，彻底消灭重复的磁盘 IO
+@st.cache_data(show_spinner=False, max_entries=2000)
+def _read_local_kline(file_path, mtime):
+    try:
+        df = pd.read_parquet(file_path)
+        df["date"] = pd.to_datetime(df["date"])
+        return df.sort_values("date").reset_index(drop=True)
     except Exception:
         return None
-
 
 def _check_seam_jump(old_df, new_df, tolerance=0.02):
     try:
@@ -644,9 +657,13 @@ def _check_seam_jump(old_df, new_df, tolerance=0.02):
         return False
 
 
-def load_or_update_kline(stock_code, days=200):
+def load_or_update_kline(stock_code, days=200, latest_td=None):
     file_path = os.path.join(DATA_DIR, f"{stock_code}.parquet")
     today = pd.Timestamp.today().normalize()
+    
+    # 如果没传入最新交易日，自己去取（只取一次）
+    if latest_td is None:
+        latest_td = get_latest_trade_date()
 
     def _tail(df):
         if len(df) > days:
@@ -663,25 +680,19 @@ def load_or_update_kline(stock_code, days=200):
 
     if os.path.exists(file_path):
         try:
-            local_df = pd.read_parquet(file_path)
-            local_df["date"] = pd.to_datetime(local_df["date"])
-            local_df = local_df.sort_values("date").reset_index(drop=True)
-
-            if not local_df.empty:
+            # 🌟 核心优化：取文件的最后修改时间，如果没变，直接命中内存缓存，0 IO 等待！
+            mtime = os.path.getmtime(file_path)
+            local_df = _read_local_kline(file_path, mtime)
+            
+            if local_df is not None and not local_df.empty:
                 last_cached = local_df["date"].max().normalize()
-                trade_dates = _get_trade_dates()
-                if trade_dates is not None:
-                    past_td = [d for d in trade_dates if d <= today]
-                    latest_td = max(past_td) if past_td else today
-                    need_update = last_cached < latest_td
-                else:
-                    need_update = (today - last_cached).days > 3
+                # 🌟 核心优化：直接比较日期，彻底干掉那个极其耗时的 for 循环！
+                need_update = last_cached < latest_td
 
                 if not need_update:
                     return _tail(local_df), None
 
                 gap_days = (today - last_cached).days
-
                 if gap_days > 120:
                     df, err = fetch_kline_from_network(stock_code, days=days)
                     if df is not None and not df.empty:
@@ -779,10 +790,6 @@ def _bs_latest_report(bs_code, query_func, max_back=8):
     return None, None, None, None
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_fundamental_data(stock_code):
-    """
-    用 Baostock 获取基本面数据（替代原乐咕乐股接口）。
-    返回结构与原函数完全一致，调用方无需改动。
-    """
     _ensure_bs_login()
     result = {
         "PE": None, "PB": None, "总市值(亿)": None,
@@ -797,27 +804,62 @@ def get_fundamental_data(stock_code):
     else:
         bs_code = f"sz.{stock_code}"
 
-    # ---- PE / PB ----
+    # ================= 1. 优先尝试从 AKShare（东方财富）获取 =================
     try:
-        rows, _ = _bs_fetch(
-            bs.query_history_k_data_plus,
-            bs_code, "date,peTTM,pbMRQ",
-            start_date=(pd.Timestamp.today() - pd.Timedelta(days=10)).strftime("%Y-%m-%d"),
-            end_date=pd.Timestamp.today().strftime("%Y-%m-%d"),
-            frequency="d", adjustflag="3",
-        )
-        if rows:
-            latest = rows[-1]
-            pe = _safe_float(latest[1])
-            pb = _safe_float(latest[2])
-            if pe is not None:
-                result["PE"] = round(pe, 2)
+        val_map = get_realtime_valuation_map()
+        if val_map and stock_code in val_map:
+            v = val_map[stock_code]
+            if v.get("PE") is not None:
+                result["PE"] = round(v["PE"], 2)
                 result["_pe_ok"] = True
-            if pb is not None and pb > 0:
-                result["PB"] = round(pb, 2)
+            if v.get("PB") is not None and v["PB"] > 0:
+                result["PB"] = round(v["PB"], 2)
+            if v.get("总市值(亿)") is not None:
+                result["总市值(亿)"] = v["总市值(亿)"]
+                result["_mv_ok"] = True
     except Exception:
         pass
-    # ---- ROE（自动倒推 + 年化）----
+
+    # ================= 2. Baostock 兜底（获取 PE / PB / 市值） =================
+    # 如果东财没拿到市值，或者没拿到PE，用 Baostock 补充
+    if not result["_pe_ok"] or not result["_mv_ok"]:
+        try:
+            rows, _ = _bs_fetch(
+                bs.query_history_k_data_plus,
+                bs_code, "date,close,peTTM,pbMRQ",
+                start_date=(pd.Timestamp.today() - pd.Timedelta(days=10)).strftime("%Y-%m-%d"),
+                end_date=pd.Timestamp.today().strftime("%Y-%m-%d"),
+                frequency="d", adjustflag="3", # adjustflag=3 表示不复权
+            )
+            if rows:
+                latest = rows[-1]
+                close_price = _safe_float(latest[1])
+                pe = _safe_float(latest[2])
+                pb = _safe_float(latest[3])
+                
+                if pe is not None and not result["_pe_ok"]:
+                    result["PE"] = round(pe, 2)
+                    result["_pe_ok"] = True
+                if pb is not None and pb > 0 and result["PB"] is None:
+                    result["PB"] = round(pb, 2)
+                
+                # 🌟 核心修复：用 收盘价 × 总股本 计算市值
+                if not result["_mv_ok"] and close_price:
+                    # 获取最新财报里的总股本 (totalShare)
+                    _, quarter, profit_rows, profit_fields = _bs_latest_report(bs_code, bs.query_profit_data)
+                    if profit_rows and quarter:
+                        for i, f in enumerate(profit_fields):
+                            if f == "totalShare":
+                                total_share = _safe_float(profit_rows[0][i])
+                                if total_share:
+                                    # 总市值(亿) = 收盘价 * 总股本 / 1亿
+                                    result["总市值(亿)"] = round(close_price * total_share / 1e8, 2)
+                                    result["_mv_ok"] = True
+                                break
+        except Exception:
+            pass
+
+    # ================= 3. ROE 与 增速 =================
     try:
         _, quarter, rows, fields = _bs_latest_report(bs_code, bs.query_profit_data)
         if rows and quarter:
@@ -826,14 +868,12 @@ def get_fundamental_data(stock_code):
                 if f == "roeAvg":
                     roe = _safe_float(latest[i])
                     if roe is not None and roe > 0:
-                        # Baostock 的 roeAvg 是"年初至今累计"
-                        # Q1 ×4、Q2 ×2、Q3 ×4/3、Q4 ×1，才是年化 ROE
                         annualized = roe * 4 / quarter
                         result["ROE(%)"] = round(annualized, 2)
                         result["_roe_ok"] = True
     except Exception:
         pass
-    # ---- 营收 / 净利润增速（自动倒推）----
+
     try:
         _, _, rows, fields = _bs_latest_report(bs_code, bs.query_growth_data)
         if rows:
@@ -1363,24 +1403,23 @@ def check_stock(kline_df, conds):
 # ============================================================
 # 单股处理（供并发使用）
 # ============================================================
-def process_one_stock(code, name, history_days, conditions, use_and, skip_st, suspended_set):
+def process_one_stock(code, name, history_days, conditions, use_and, skip_st, suspended_set, latest_td):
     if skip_st:
         if is_special_stock(name) or code in suspended_set:
             return {"status": "skipped", "code": code, "name": name}
-    kline, err = load_or_update_kline(code, days=history_days)
+            
+    # 传入最新的交易日
+    kline, err = load_or_update_kline(code, days=history_days, latest_td=latest_td)
     if kline is None or len(kline) < 60:
         return {"status": "failed", "code": code, "name": name, "error": err or "数据不足60天"}
+        
+    # 🌟 核心优化：这里直接比较，删掉原本那段巨慢的 past_td 列表推导式
     last_date = pd.to_datetime(kline["date"].iloc[-1]).normalize()
-    today = pd.Timestamp.today().normalize()
-    trade_dates = _get_trade_dates()
-    if trade_dates:
-        past_td = [d for d in trade_dates if d <= today]
-        latest_td = max(past_td) if past_td else today
-        if last_date < latest_td:
-            return {"status": "failed", "code": code, "name": name, "error": f"数据未更新到最新({last_date.date()})，已跳过"}
+    if last_date < latest_td:
+        return {"status": "failed", "code": code, "name": name, "error": f"数据未更新到最新({last_date.date()})，已跳过"}
+        
     hits, enabled_count, snap = check_stock(kline, conditions)
 
-    # 没勾任何技术条件 → 全部放行，交给基本面阶段
     if enabled_count == 0:
         ok = True
     elif use_and:
@@ -1389,7 +1428,6 @@ def process_one_stock(code, name, history_days, conditions, use_and, skip_st, su
         ok = len(hits) > 0
 
     return {"status": "done", "code": code, "name": name, "hits": hits, "snap": snap, "ok": ok}
-
 
 # ============================================================
 # Excel 导出
@@ -1905,21 +1943,26 @@ if start_button:
     progress_bar = st.progress(0, text="准备开始...")
     status_text = st.empty()
 
+    # 🌟 核心优化：主线程只计算一次最新交易日，分发给所有子线程
+    latest_td = get_latest_trade_date()
+
     tech_passed = []
     all_scanned = []
     failed = 0
     skipped = 0
     fail_reasons = {}
+    
     if use_concurrent:
         st.info(f"并发模式：{num_workers} 线程")
         rows = list(comp_df.iterrows())
         with ThreadPoolExecutor(max_workers=num_workers) as ex:
+            # 🌟 传入 latest_td
             futures = {ex.submit(process_one_stock, row["code"], row["name"],
-                                  history_days, conditions, use_and, skip_st, suspended_set): row
+                                  history_days, conditions, use_and, skip_st, suspended_set, latest_td): row
                        for _, row in rows}
             for i, fut in enumerate(as_completed(futures)):
                 res = fut.result()
-                # 🌟 优化：每处理 10 个或者到最后一个时，才刷新一次进度条，防止前端卡死
+                # 每处理 10 个或者到最后一个时，才刷新一次进度条，防止前端卡死
                 if (i + 1) % 10 == 0 or (i + 1) == len(rows):
                     progress_bar.progress((i + 1) / len(rows), text=f"进度 {i+1}/{len(rows)}")
                 
@@ -1937,12 +1980,13 @@ if start_button:
         for i, row in comp_df.iterrows():
             code, name = row["code"], row["name"]
             
-            # 🌟 优化：每处理 10 个或者到最后一个时，才刷新一次进度条
+            # 每处理 10 个或者到最后一个时，才刷新一次进度条
             if (i + 1) % 10 == 0 or (i + 1) == len(comp_df):
                 status_text.text(f"处理 [{i+1}/{len(comp_df)}] {code} {name}")
                 progress_bar.progress((i + 1) / len(comp_df), text=f"进度 {i+1}/{len(comp_df)} — {code} {name}")
                 
-            res = process_one_stock(code, name, history_days, conditions, use_and, skip_st, suspended_set)
+            # 🌟 传入 latest_td
+            res = process_one_stock(code, name, history_days, conditions, use_and, skip_st, suspended_set, latest_td)
             if res["status"] == "skipped":
                 skipped += 1
             elif res["status"] == "failed":
@@ -2032,10 +2076,14 @@ if start_button:
     else:
         final_results = tech_passed
 
-    # ===== 评分 & 排序 =====
+        # ===== 评分 & 排序 =====
     for item in final_results:
         hits = item["命中条件"].split(" | ") if item["命中条件"] else []
-        fund_dict = {"PE": item.get("PE"), "ROE(%)": item.get("ROE(%)")}
+        # 🌟 关键修改：只有在左侧勾选了对应条件，才把它放进评分字典
+        fund_dict = {
+            "PE": item.get("PE") if pe_on else None,
+            "ROE(%)": item.get("ROE(%)") if roe_on else None
+        }
         score, detail = compute_score(hits, fund_dict)
         item["综合评分"] = score
         item["评分明细"] = detail
@@ -2114,6 +2162,7 @@ if "last_results" in st.session_state:
 
         # 直接固定为按综合评分降序排列（分数高的在前面）
         df_display = df_display.sort_values("综合评分", ascending=False).reset_index(drop=True)
+        df_to_export = df[display_cols].sort_values("综合评分", ascending=False).reset_index(drop=True)
 
         exp1, exp2 = st.columns(2)
         with exp1:
@@ -2127,7 +2176,7 @@ if "last_results" in st.session_state:
             )
         with exp2:
             if HAS_OPENPYXL:
-                xlsx_data = export_to_excel(df)
+                xlsx_data = export_to_excel(df_to_export)
                 st.download_button(
                     "📊 下载 Excel（带格式）", data=xlsx_data,
                     file_name=f"筛选结果_{index_name_display}_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
@@ -2381,6 +2430,18 @@ else:
 
                 if not hdf.empty:
                     hdf = hdf.copy()
+                    
+                    # 🌟 新增：利用历史存下来的结果，只保留基础列和当前记录里确实有值的列
+                    # （排除空列，或者未勾选但被填了数据的列）
+                    # 因为没法知道当时勾选了啥，最稳妥的做法是隐藏缺失率极高的列
+                    drop_cols = []
+                    for col in hdf.columns:
+                        if col not in ["代码", "名称", "综合评分", "数据日期", "最新价", "涨跌幅(%)", "命中条件", "评分明细", "评分标签"]:
+                            if hdf[col].isna().all():
+                                drop_cols.append(col)
+                    hdf = hdf.drop(columns=drop_cols)
+                    
+                    # 下面是一堆格式化代码...
 
                     if "综合评分" in hdf.columns:
                         hdf["评分标签"] = hdf["综合评分"].apply(
