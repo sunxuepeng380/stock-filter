@@ -6,6 +6,8 @@ import streamlit as st
 import akshare as ak
 import time
 import baostock as bs
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 def _ensure_bs_login(force=False):
     """确保 Baostock 已登录。10 分钟自动重登，或 force=True 强制重登。"""
@@ -272,6 +274,27 @@ def clear_all_history():
     try:
         conn = sqlite3.connect(get_history_db_path())
         conn.execute("DELETE FROM screening_history")
+        conn.commit()
+        conn.close()
+        return True
+    except Exception:
+        return False
+def clear_all_history():
+    try:
+        conn = sqlite3.connect(get_history_db_path())
+        conn.execute("DELETE FROM screening_history")
+        conn.commit()
+        conn.close()
+        return True
+    except Exception:
+        return False
+
+# 👇 🌟 新增：只清空未回测的记录，保留已回测数据
+def clear_unbacktested_history():
+    try:
+        conn = sqlite3.connect(get_history_db_path())
+        # 只删除 is_backtested 为 0 或者为空的记录
+        conn.execute("DELETE FROM screening_history WHERE is_backtested = 0 OR is_backtested IS NULL")
         conn.commit()
         conn.close()
         return True
@@ -614,27 +637,46 @@ def fetch_kline_from_network(stock_code, days=200):
 
 
 # ============================================================
-# 交易日历 & 除权检测辅助函数
 # ============================================================
-# 🌟 优化1：直接返回最新的交易日，不再返回巨大的日历 set
-@st.cache_data(ttl=86400, show_spinner=False)
+# 交易日历 & 除权检测辅助函数
+@st.cache_data(ttl=1800, show_spinner=False)
 def get_latest_trade_date():
+    """
+    智能获取最新有效的完整交易日：16:00前算昨天，16:00后算今天。
+    """
     try:
         df = ak.tool_trade_date_hist_sina()
         tdates = pd.to_datetime(df["trade_date"]).dt.normalize()
-        today = pd.Timestamp.today().normalize()
-        past_dates = tdates[tdates <= today]
-        return past_dates.max() if not past_dates.empty else today
+        now = pd.Timestamp.now()
+        today = now.normalize()
+        if now.hour < 16:
+            cutoff_date = today - pd.Timedelta(days=1)
+        else:
+            cutoff_date = today
+        past_dates = tdates[tdates <= cutoff_date]
+        return past_dates.max() if not past_dates.empty else cutoff_date
     except Exception:
-        return pd.Timestamp.today().normalize()
+        now = pd.Timestamp.now()
+        if now.hour < 16:
+            return (now - pd.Timedelta(days=1)).normalize()
+        else:
+            return now.normalize()
 
-# 🌟 优化2：利用文件的修改时间(mtime)作为缓存键，彻底消灭重复的磁盘 IO
-@st.cache_data(show_spinner=False, max_entries=2000)
+# 🌟 终极优化：改用普通的全局字典做内存缓存，彻底绕开 Streamlit 多线程锁和深拷贝开销
+_KLINE_MEM_CACHE = {}
+
 def _read_local_kline(file_path, mtime):
+    cache_key = (file_path, mtime)
+    if cache_key in _KLINE_MEM_CACHE:
+        return _KLINE_MEM_CACHE[cache_key]
     try:
         df = pd.read_parquet(file_path)
         df["date"] = pd.to_datetime(df["date"])
-        return df.sort_values("date").reset_index(drop=True)
+        df = df.sort_values("date").reset_index(drop=True)
+        _KLINE_MEM_CACHE[cache_key] = df
+        if len(_KLINE_MEM_CACHE) > 3000:
+            _KLINE_MEM_CACHE.clear()
+        return df
     except Exception:
         return None
 
@@ -656,12 +698,10 @@ def _check_seam_jump(old_df, new_df, tolerance=0.02):
     except Exception:
         return False
 
-
-def load_or_update_kline(stock_code, days=200, latest_td=None):
+def load_or_update_kline(stock_code, days=200, latest_td=None, force_offline=False):
     file_path = os.path.join(DATA_DIR, f"{stock_code}.parquet")
     today = pd.Timestamp.today().normalize()
     
-    # 如果没传入最新交易日，自己去取（只取一次）
     if latest_td is None:
         latest_td = get_latest_trade_date()
 
@@ -680,16 +720,14 @@ def load_or_update_kline(stock_code, days=200, latest_td=None):
 
     if os.path.exists(file_path):
         try:
-            # 🌟 核心优化：取文件的最后修改时间，如果没变，直接命中内存缓存，0 IO 等待！
             mtime = os.path.getmtime(file_path)
             local_df = _read_local_kline(file_path, mtime)
             
             if local_df is not None and not local_df.empty:
                 last_cached = local_df["date"].max().normalize()
-                # 🌟 核心优化：直接比较日期，彻底干掉那个极其耗时的 for 循环！
-                need_update = last_cached < latest_td
-
-                if not need_update:
+                
+                # 如果是极速模式，或者数据已经最新，直接返回
+                if force_offline or last_cached >= latest_td:
                     return _tail(local_df), None
 
                 gap_days = (today - last_cached).days
@@ -724,50 +762,55 @@ def load_or_update_kline(stock_code, days=200, latest_td=None):
         except Exception:
             pass
 
+    # 🌟 核心修复：如果是强制离线模式，且本地没找到文件，直接返回空，绝不联网卡死！
+    if force_offline:
+        return None, "本地无该股缓存数据，极速模式已跳过"
+
     df, err = fetch_kline_from_network(stock_code, days=days)
     if df is not None and not df.empty:
         df = _tail(df)
         _save(df)
     return df, err
-
 @st.cache_data(ttl=1800, show_spinner=False)
 def get_realtime_valuation_map():
     """
-    【备用数据源】东方财富实时行情，一次拉取覆盖全市场。
-    比乐咕乐股稳定得多，用来兜底 PE / PB / 总市值。
-    返回：{code: {"PE": float|None, "PB": float|None, "总市值(亿)": float|None}}
+    🌟 核心修复：由于东财接口极易限流，这里直接返回空字典。
+    系统会自动走下方 get_fundamental_data 里的 Baostock 兜底逻辑。
     """
-    try:
-        df = ak.stock_zh_a_spot_em()
-        if df is None or df.empty:
-            return {}
-        keep_cols = ["代码", "市盈率-动态", "市净率", "总市值"]
-        cols = [c for c in keep_cols if c in df.columns]
-        df = df[cols].copy()
-        df["代码"] = df["代码"].astype(str).str.zfill(6)
+    return {}
 
-        result = {}
-        for _, row in df.iterrows():
-            code = row["代码"]
-            pe = _safe_float(row.get("市盈率-动态"))
-            pb = _safe_float(row.get("市净率"))
-            mv = _safe_float(row.get("总市值"))
-            result[code] = {
-                "PE": pe,
-                "PB": pb,
-                "总市值(亿)": round(mv / 1e8, 2) if mv is not None else None,
-            }
-        return result
-    except Exception:
-        return {}
-
-
-# ============================================================
-# 基本面
-# ============================================================
 # ============================================================
 # 基本面（Baostock 数据源）
 # ============================================================
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_valuation_percentile(stock_code):
+    """获取个股近3年的 PE/PB 历史分位"""
+    try:
+        # 乐咕乐股接口：获取个股历史估值指标
+        df = ak.stock_a_indicator_lg(symbol=stock_code)
+        if df is None or df.empty:
+            return None, None
+        
+        # 取近3年（约 750 个交易日）的数据
+        recent_df = df.tail(750).copy()
+        
+        # 计算当前值在历史上的百分位（0% 表示历史极低，100% 表示历史极高）
+        pe_series = recent_df["pe_ttm"].dropna()
+        pb_series = recent_df["pb"].dropna()
+        
+        if pe_series.empty or pb_series.empty:
+            return None, None
+
+        current_pe = pe_series.iloc[-1]
+        current_pb = pb_series.iloc[-1]
+        
+        pe_pct = (pe_series < current_pe).sum() / len(pe_series) * 100
+        pb_pct = (pb_series < current_pb).sum() / len(pb_series) * 100
+        
+        return round(pe_pct, 1), round(pb_pct, 1)
+    except Exception:
+        return None, None
+
 def _bs_latest_report(bs_code, query_func, max_back=8):
     """
     从当前季度起往前倒推，找到最近一个有数据的季度。
@@ -794,6 +837,7 @@ def get_fundamental_data(stock_code):
     result = {
         "PE": None, "PB": None, "总市值(亿)": None,
         "ROE(%)": None, "净利润增速(%)": None, "营收增速(%)": None,
+        "PE分位(%)": None, "PB分位(%)": None,   # 🌟 新增：历史分位字段
         "_pe_ok": False, "_roe_ok": False, "_mv_ok": False,
         "_profit_ok": False, "_rev_ok": False,
     }
@@ -803,6 +847,16 @@ def get_fundamental_data(stock_code):
         bs_code = f"sh.{stock_code}"
     else:
         bs_code = f"sz.{stock_code}"
+
+    # 🌟 新增：优先通过乐咕乐股获取历史估值分位
+    try:
+        pe_pct, pb_pct = get_valuation_percentile(stock_code)
+        if pe_pct is not None:
+            result["PE分位(%)"] = pe_pct
+        if pb_pct is not None:
+            result["PB分位(%)"] = pb_pct
+    except Exception:
+        pass
 
     # ================= 1. 优先尝试从 AKShare（东方财富）获取 =================
     try:
@@ -821,7 +875,6 @@ def get_fundamental_data(stock_code):
         pass
 
     # ================= 2. Baostock 兜底（获取 PE / PB / 市值） =================
-    # 如果东财没拿到市值，或者没拿到PE，用 Baostock 补充
     if not result["_pe_ok"] or not result["_mv_ok"]:
         try:
             rows, _ = _bs_fetch(
@@ -843,16 +896,13 @@ def get_fundamental_data(stock_code):
                 if pb is not None and pb > 0 and result["PB"] is None:
                     result["PB"] = round(pb, 2)
                 
-                # 🌟 核心修复：用 收盘价 × 总股本 计算市值
                 if not result["_mv_ok"] and close_price:
-                    # 获取最新财报里的总股本 (totalShare)
                     _, quarter, profit_rows, profit_fields = _bs_latest_report(bs_code, bs.query_profit_data)
                     if profit_rows and quarter:
                         for i, f in enumerate(profit_fields):
                             if f == "totalShare":
                                 total_share = _safe_float(profit_rows[0][i])
                                 if total_share:
-                                    # 总市值(亿) = 收盘价 * 总股本 / 1亿
                                     result["总市值(亿)"] = round(close_price * total_share / 1e8, 2)
                                     result["_mv_ok"] = True
                                 break
@@ -1036,19 +1086,11 @@ def is_special_stock(name):
     if n.startswith("N"): return True
     return False
 
-
 @st.cache_data(ttl=1800, show_spinner=False)
 def get_suspended_stocks():
-    try:
-        df = ak.stock_zh_a_spot_em()
-        if "交易状态" in df.columns:
-            return set(df[df["交易状态"] != "交易"]["代码"].astype(str).str.zfill(6).tolist())
-        if "最新价" in df.columns:
-            return set(df[(df["最新价"].isna()) | (df["最新价"] == 0)]["代码"].astype(str).str.zfill(6).tolist())
-        return set()
-    except Exception:
-        return set()
-
+    # 🌟 核心修复：彻底废弃全市场快照接口，防止拉取5000只股票被东财封IP
+    # 返回空集合，依靠本地K线的成交量或收盘价来判断停牌
+    return set()
 
 def to_weekly(kline_df):
     df = kline_df.copy()
@@ -1401,33 +1443,33 @@ def check_stock(kline_df, conds):
 
 
 # ============================================================
-# 单股处理（供并发使用）
 # ============================================================
+# 单股处理（供并发使用）
 def process_one_stock(code, name, history_days, conditions, use_and, skip_st, suspended_set, latest_td):
-    if skip_st:
-        if is_special_stock(name) or code in suspended_set:
-            return {"status": "skipped", "code": code, "name": name}
+    try:
+        if skip_st:
+            if is_special_stock(name) or code in suspended_set:
+                return {"status": "skipped", "code": code, "name": name}
+                
+        # 强制 force_offline=True，如果本地没有数据，它就在本地报错，绝对不去网络死磕
+        kline, err = load_or_update_kline(code, days=history_days, latest_td=latest_td, force_offline=True)
+        
+        if kline is None or len(kline) < 60:
+            return {"status": "failed", "code": code, "name": name, "error": err or "本地无数据或不足60天"}
             
-    # 传入最新的交易日
-    kline, err = load_or_update_kline(code, days=history_days, latest_td=latest_td)
-    if kline is None or len(kline) < 60:
-        return {"status": "failed", "code": code, "name": name, "error": err or "数据不足60天"}
+        hits, enabled_count, snap = check_stock(kline, conditions)
         
-    # 🌟 核心优化：这里直接比较，删掉原本那段巨慢的 past_td 列表推导式
-    last_date = pd.to_datetime(kline["date"].iloc[-1]).normalize()
-    if last_date < latest_td:
-        return {"status": "failed", "code": code, "name": name, "error": f"数据未更新到最新({last_date.date()})，已跳过"}
+        if enabled_count == 0:
+            ok = True
+        elif use_and:
+            ok = (len(hits) >= enabled_count)
+        else:
+            ok = len(hits) > 0
+            
+        return {"status": "done", "code": code, "name": name, "hits": hits, "snap": snap, "ok": ok}
         
-    hits, enabled_count, snap = check_stock(kline, conditions)
-
-    if enabled_count == 0:
-        ok = True
-    elif use_and:
-        ok = (len(hits) >= enabled_count)
-    else:
-        ok = len(hits) > 0
-
-    return {"status": "done", "code": code, "name": name, "hits": hits, "snap": snap, "ok": ok}
+    except Exception as e:
+        return {"status": "failed", "code": code, "name": name, "error": f"系统异常: {str(e)[:30]}"}
 
 # ============================================================
 # Excel 导出
@@ -1617,8 +1659,10 @@ with st.sidebar:
                 st.write("、".join(wl))
 
     with st.expander("⚡ 性能设置", expanded=False):
-        use_concurrent = st.checkbox("启用并发拉取（更快，但可能被限流）", value=False, key="perf_concurrent")
-        num_workers = st.slider("并发线程数", 2, 5, 3, 1, key="perf_workers", disabled=not use_concurrent)
+        use_concurrent = st.checkbox("启用并发拉取（更快，但可能被限流）", value=True, key="perf_concurrent")
+        num_workers = st.slider("并发线程数", 2, 20, 4, 1, key="perf_workers", disabled=not use_concurrent)
+        # 🌟 新增：强制离线开关
+        #force_offline = st.checkbox("强制离线扫描（跳过网络更新，极速）", value=True, key="perf_offline", help="如果本地已有K线缓存，勾选后程序绝不发起网络请求，几秒钟即可出结果。")
 
     with st.expander("🗄️ 数据管理", expanded=False):
         skip_st = st.checkbox("自动过滤 ST / 停牌 / 新股", value=True, key="chk_skip")
@@ -1692,6 +1736,13 @@ with st.sidebar:
 
         rev_on = st.checkbox("净资产增速 下限", value=False, key="rev_on", disabled=not fund_on)
         rev_min = st.number_input("净资产增速 ≥ (%)", -100.0, 500.0, 0.0, 5.0, key="rev_min", disabled=not (fund_on and rev_on))
+        st.divider()
+        pct_on = st.checkbox("历史估值分位筛选 (近3年)", value=False, key="pct_on", disabled=not fund_on, help="0%代表历史最低估值，100%代表最高估值。专治绝对值误杀。")
+        pc1, pc2 = st.columns(2)
+        with pc1:
+            pe_pct_max = st.number_input("PE分位 ≤ (%)", 0.0, 100.0, 20.0, 5.0, key="pe_pct_max", disabled=not (fund_on and pct_on))
+        with pc2:
+            pb_pct_max = st.number_input("PB分位 ≤ (%)", 0.0, 100.0, 20.0, 5.0, key="pb_pct_max", disabled=not (fund_on and pct_on))
 
     with st.expander("📊 均线类", expanded=False):
         ma_golden_on = st.checkbox("启用均线金叉", value=False, key="ui_ma_g_on")
@@ -1864,19 +1915,64 @@ else:
     st.caption(f"筛选逻辑：{logic_mode}")
 
 st.divider()
-start_button = st.button("🚀 开始筛选", type="primary", width="stretch"
+col_btn1, col_btn2 = st.columns([1, 1])
+with col_btn1:
+    start_button = st.button("🚀 开始极速筛选 (纯本地)", type="primary", width="stretch")
+with col_btn2:
+    # 🌟 加上 type="primary" 消除视觉错觉，让它也变成醒目的可点击状态
+    update_button = st.button("🔄 一键联网更新并筛选", type="primary", width="stretch", help="点击后，系统会先拉取全市场快照更新数据，然后自动无缝执行筛选。")
 
-)
+do_screen = False
 
+# 如果点击了“一键联网更新并筛选”
+if update_button:
+    with st.spinner("正在精准更新当前股票池的最新K线..."):
+        try:
+            index_code = INDEX_CODE_MAP[index_name]
+            comp_df, _ = get_index_components(index_code)
+            if comp_df is None or comp_df.empty:
+                st.error("获取成分股失败，无法更新。")
+            else:
+                latest_td = get_latest_trade_date()
+                progress_bar = st.progress(0, text="准备更新...")
+                rows = list(comp_df.iterrows())
+                updated_count = 0
+                
+                # 🌟 核心修改：放弃全市场快照，采用并发，只拉取股票池里的股票！
+                def force_update_one(code):
+                    # force_offline=False 强制走网络更新
+                    return load_or_update_kline(code, days=history_days, latest_td=latest_td, force_offline=False)
+                
+                # 使用线程池（比如并发 4 个），快速且安全地拉取这几十/几百只股票
+                with ThreadPoolExecutor(max_workers=num_workers) as ex:
+                    futures = {ex.submit(force_update_one, row["code"]): row for _, row in rows}
+                    for i, fut in enumerate(as_completed(futures)):
+                        progress_bar.progress((i + 1) / len(rows), text=f"正在更新进度 {i+1}/{len(rows)}")
+                        try: 
+                            fut.result()
+                            updated_count += 1
+                        except: 
+                            pass
+                
+                progress_bar.empty()
+                st.success(f"✅ 更新完成！已针对【{index_name}】成功拉取 {updated_count} 只股票的最新数据。正在自动执行筛选...")
+                do_screen = True
+        except Exception as e:
+            st.error(f"更新失败：{e}")
 
-# ============================================================
-# 执行筛选
-# ============================================================
+# 如果点击了“纯本地极速筛选”
 if start_button:
+    do_screen = True
+
+# ============================================================
+# 执行筛选逻辑
+# ============================================================
+if do_screen:
     if not active:
-        st.error("请先勾选至少一个筛选条件。")
+        st.error("⚠️ 请先在左侧勾选至少一个筛选条件！")
         st.stop()
 
+    # 下面的 conditions 不用动
     conditions = {
         "ma_golden": {"enabled": ma_golden_on, "fast": ma_fast, "slow": ma_slow},
         "ma_bull":   {"enabled": ma_bull_on},
@@ -1932,7 +2028,6 @@ if start_button:
         comp_df = comp_df[comp_df["code"].isin(wl)].reset_index(drop=True)
         st.info(f"已过滤为自选股 {len(comp_df)} 只")
 
-    # 【修复2】显示成分股数量校验
     expected = INDEX_EXPECTED_COUNT.get(index_code)
     st.success(f"✅ {index_name} 共 {len(comp_df)} 只股票" + (f"（理论约 {expected} 只）" if expected else ""))
 
@@ -1943,7 +2038,6 @@ if start_button:
     progress_bar = st.progress(0, text="准备开始...")
     status_text = st.empty()
 
-    # 🌟 核心优化：主线程只计算一次最新交易日，分发给所有子线程
     latest_td = get_latest_trade_date()
 
     tech_passed = []
@@ -1956,13 +2050,11 @@ if start_button:
         st.info(f"并发模式：{num_workers} 线程")
         rows = list(comp_df.iterrows())
         with ThreadPoolExecutor(max_workers=num_workers) as ex:
-            # 🌟 传入 latest_td
             futures = {ex.submit(process_one_stock, row["code"], row["name"],
                                   history_days, conditions, use_and, skip_st, suspended_set, latest_td): row
                        for _, row in rows}
             for i, fut in enumerate(as_completed(futures)):
                 res = fut.result()
-                # 每处理 10 个或者到最后一个时，才刷新一次进度条，防止前端卡死
                 if (i + 1) % 10 == 0 or (i + 1) == len(rows):
                     progress_bar.progress((i + 1) / len(rows), text=f"进度 {i+1}/{len(rows)}")
                 
@@ -1980,12 +2072,10 @@ if start_button:
         for i, row in comp_df.iterrows():
             code, name = row["code"], row["name"]
             
-            # 每处理 10 个或者到最后一个时，才刷新一次进度条
             if (i + 1) % 10 == 0 or (i + 1) == len(comp_df):
                 status_text.text(f"处理 [{i+1}/{len(comp_df)}] {code} {name}")
                 progress_bar.progress((i + 1) / len(comp_df), text=f"进度 {i+1}/{len(comp_df)} — {code} {name}")
                 
-            # 🌟 传入 latest_td
             res = process_one_stock(code, name, history_days, conditions, use_and, skip_st, suspended_set, latest_td)
             if res["status"] == "skipped":
                 skipped += 1
@@ -2004,7 +2094,7 @@ if start_button:
 
     # ===== 第二阶段：基本面 =====
     final_results = []
-    rejected_fund = []  # 【修复1】记录被基本面拒掉的股票，方便排查
+    rejected_fund = []  
     if fund_on and tech_passed:
         st.markdown("### 💰 第二阶段：基本面筛选")
         fund_bar = st.progress(0, text="拉取基本面...")
@@ -2019,7 +2109,6 @@ if start_button:
                          "ROE(%)": fund["ROE(%)"], "净利润增速(%)": fund["净利润增速(%)"],
                          "营收增速(%)": fund["营收增速(%)"]})
 
-            # 【修复1】缺失数据 → 直接拒掉；每条规则单独判断，记录拒因
             ok = True
             reasons = []
 
@@ -2059,6 +2148,18 @@ if start_button:
                 elif fund["营收增速(%)"] < rev_min:
                     ok = False; reasons.append(f"营收增速={fund['营收增速(%)']:.1f}<{rev_min}")
 
+            # 🌟 修复：将分位过滤逻辑正确缩进在循环内部
+            if pct_on:
+                if fund["PE分位(%)"] is None:
+                    ok = False; reasons.append("PE分位缺失")
+                elif fund["PE分位(%)"] > pe_pct_max:
+                    ok = False; reasons.append(f"PE分位={fund['PE分位(%)']}%>{pe_pct_max}%")
+                    
+                if fund["PB分位(%)"] is None:
+                    ok = False; reasons.append("PB分位缺失")
+                elif fund["PB分位(%)"] > pb_pct_max:
+                    ok = False; reasons.append(f"PB分位={fund['PB分位(%)']}%>{pb_pct_max}%")
+
             if ok:
                 fund_pass.append(item)
             else:
@@ -2069,17 +2170,14 @@ if start_button:
         st.info(f"第二阶段完成：基本面通过 **{len(fund_pass)}** 只（被拒 {len(rejected_fund)} 只）")
         if rejected_fund:
             with st.expander(f"🔎 查看被基本面拒掉的 {len(rejected_fund)} 只（含拒因）", expanded=False):
-                st.dataframe(pd.DataFrame(rejected_fund), width="stretch"
-
-, hide_index=True)
+                st.dataframe(pd.DataFrame(rejected_fund), width="stretch", hide_index=True)
         final_results = fund_pass
     else:
         final_results = tech_passed
 
-        # ===== 评分 & 排序 =====
+    # ===== 评分 & 排序 =====
     for item in final_results:
         hits = item["命中条件"].split(" | ") if item["命中条件"] else []
-        # 🌟 关键修改：只有在左侧勾选了对应条件，才把它放进评分字典
         fund_dict = {
             "PE": item.get("PE") if pe_on else None,
             "ROE(%)": item.get("ROE(%)") if roe_on else None
@@ -2098,6 +2196,7 @@ if start_button:
     st.session_state["last_fail_reasons"] = fail_reasons
     st.session_state["last_index_name"] = index_name
     st.session_state["last_comp_count"] = len(comp_df)
+
 # ============================================================
 # 结果展示
 # ============================================================
@@ -2138,6 +2237,8 @@ if "last_results" in st.session_state:
         if fund_on and roe_on:     col_order.append("ROE(%)")
         if fund_on and profit_on:  col_order.append("净利润增速(%)")
         if fund_on and rev_on:     col_order.append("营收增速(%)")
+        if fund_on and pct_on:     col_order.append("PE分位(%)")
+        if fund_on and pct_on:     col_order.append("PB分位(%)")
         # 总市值列：你觉得没用就不显示，想恢复就把下面这行注释解开
         # if fund_on and mv_on:    col_order.append("总市值(亿)")
 
@@ -2164,6 +2265,7 @@ if "last_results" in st.session_state:
         df_display = df_display.sort_values("综合评分", ascending=False).reset_index(drop=True)
         df_to_export = df[display_cols].sort_values("综合评分", ascending=False).reset_index(drop=True)
 
+        # ================= 下载按钮区域 =================
         exp1, exp2 = st.columns(2)
         with exp1:
             csv_data = df.to_csv(index=False, encoding="utf-8-sig")
@@ -2171,8 +2273,6 @@ if "last_results" in st.session_state:
                 "📥 下载 CSV", data=csv_data,
                 file_name=f"筛选结果_{index_name_display}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
                 mime="text/csv", width="stretch"
-
-,
             )
         with exp2:
             if HAS_OPENPYXL:
@@ -2182,15 +2282,13 @@ if "last_results" in st.session_state:
                     file_name=f"筛选结果_{index_name_display}_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     width="stretch"
-
-,
                 )
             else:
                 st.caption("安装 openpyxl 后可导出 Excel")
 
-        st.caption("💡 点击表格中的任意一行，右侧会显示该股票的K线图和详情。")
-        col_left, col_right = st.columns([3, 2])
-
+        st.caption("💡 点击上方表格中的任意一行，下方会展示该股票的 K 线深度详情。")
+        
+        # 数据格式化
         df_display = df_display.copy()
 
         df_display["评分标签"] = df_display["综合评分"].apply(
@@ -2214,84 +2312,137 @@ if "last_results" in st.session_state:
             cols.insert(cols.index("综合评分") + 1, cols.pop(cols.index("评分标签")))
             df_display = df_display[cols]
 
-        with col_left:
-            sel = st.dataframe(
-                df_display,
-                width="stretch"
+        # ================= 顶部全宽表格 =================
+        sel = st.dataframe(
+            df_display,
+            width="stretch",
+            height=320,  # 表格高度稍微调小，给下面的图表留空间
+            on_select="rerun",
+            selection_mode="single-row",
+            key="result_table_main",
+            column_config={
+                "综合评分": st.column_config.ProgressColumn(
+                    "综合评分",
+                    help="综合评分，最高150分",
+                    format="%d",
+                    min_value=0,
+                    max_value=150,
+                ),
+                "涨跌幅(%)": st.column_config.TextColumn("涨跌幅(%)", width="small"),
+                "日K": st.column_config.TextColumn("日K", width="small"),
+                "周K": st.column_config.TextColumn("周K", width="small"),
+                "月K": st.column_config.TextColumn("月K", width="small"),
+                "代码": st.column_config.TextColumn("代码", width="small"),
+                "名称": st.column_config.TextColumn("名称", width="small"),
+                "命中条件": st.column_config.TextColumn("命中条件", width="large"),
+            },
+        )
 
-,
-                height=520,
-                on_select="rerun",
-                selection_mode="single-row",
-                key="result_table",
-                column_config={
-                    "综合评分": st.column_config.ProgressColumn(
-                        "综合评分",
-                        help="综合评分，最高150分",
-                        format="%d",
-                        min_value=0,
-                        max_value=150,
-                    ),
-                    "涨跌幅(%)": st.column_config.TextColumn("涨跌幅(%)", width="small"),
-                    "日K": st.column_config.TextColumn("日K", width="small"),
-                    "周K": st.column_config.TextColumn("周K", width="small"),
-                    "月K": st.column_config.TextColumn("月K", width="small"),
-                    "代码": st.column_config.TextColumn("代码", width="small"),
-                    "名称": st.column_config.TextColumn("名称", width="small"),
-                    "命中条件": st.column_config.TextColumn("命中条件", width="large"),
-                },
-            )
+        st.divider()
 
-        with col_right:
+        # ================= 底部图表数据区 =================
+        selected_rows = []
+        try:
+            if sel is not None and hasattr(sel, "selection"):
+                selected_rows = sel.selection.get("rows", []) if isinstance(sel.selection, dict) else sel.selection.rows
+        except Exception:
             selected_rows = []
-            try:
-                if sel is not None and hasattr(sel, "selection"):
-                    selected_rows = sel.selection.get("rows", []) if isinstance(sel.selection, dict) else sel.selection.rows
-            except Exception:
-                selected_rows = []
+            
+        if selected_rows:
+            row_idx = selected_rows[0]
+            if 0 <= row_idx < len(df_display):
+                sc = str(df_display.iloc[row_idx]["代码"]).zfill(6)
+                sn = df_display.iloc[row_idx]["名称"]
+                st.markdown(f"### 📌 {sc} {sn}")
                 
-            if selected_rows:
-                row_idx = selected_rows[0]
-                # 💡 边界判断
-                if 0 <= row_idx < len(df_display):
-                    sc = str(df_display.iloc[row_idx]["代码"]).zfill(6)
-                    sn = df_display.iloc[row_idx]["名称"]
-                    st.markdown(f"### 📌 {sc} {sn}")
+                # 获取数据
+                detail_df, _ = load_or_update_kline(sc, days=history_days, force_offline=True)
+                
+                if detail_df is not None and len(detail_df) > 20:
+                    # 下方左右分栏布局（左边图表占大头，右边数据占小头）
+                    col_chart, col_info = st.columns([7, 3])
                     
-                    # --- 下面是你原本的展示详情代码，请确保完整保留 ---
-                    detail_df, _ = load_or_update_kline(sc, days=min(history_days, 250))
-                    if detail_df is not None and len(detail_df) > 20:
-                        chart_df = detail_df.set_index("date")[["close"]].copy()
-                        chart_df.columns = ["收盘价"]
-                        st.line_chart(chart_df, height=200)
+                    with col_chart:
+                        # K 线图表
+                        st.write("📊 **图表显示周期**")
+                        view_days = st.radio(
+                            label="选择显示天数", 
+                            options=[30, 60, 120, 250], 
+                            index=1, 
+                            format_func=lambda x: f"近 {x} 天",
+                            horizontal=True,
+                            label_visibility="collapsed"
+                        )
+                        
+                        chart_df = detail_df.tail(view_days).copy()
+                        import numpy as np
+                        colors = np.where(chart_df['close'] >= chart_df['open'], 'red', 'green')
+                        chart_df['MA20'] = chart_df['close'].rolling(20).mean()
+                        chart_df['volume_wan'] = chart_df['volume'] / 1000000
+                        
+                        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
+                                            vertical_spacing=0.03, subplot_titles=('K线', '成交量(万手)'), 
+                                            row_width=[0.2, 0.7])
+
+                        fig.add_trace(go.Candlestick(
+                            x=chart_df['date'],
+                            open=chart_df['open'], high=chart_df['high'],
+                            low=chart_df['low'], close=chart_df['close'],
+                            increasing_line_color='red', decreasing_line_color='green',
+                            name='K线'
+                        ), row=1, col=1)
+
+                        fig.add_trace(go.Scatter(x=chart_df['date'], y=chart_df['MA20'], line=dict(color='orange', width=1.5), name='MA20'), row=1, col=1)
+                        fig.add_trace(go.Bar(x=chart_df['date'], y=chart_df['volume_wan'], marker_color=colors, name='成交量'), row=2, col=1)
+                        
+                        fig.update_layout(
+                            height=500, # 高度加长，图表更舒展
+                            margin=dict(l=20, r=20, t=30, b=20),
+                            xaxis_rangeslider_visible=False,
+                            showlegend=False,
+                            template="plotly_white"
+                        )
+                        fig.update_yaxes(tickformat=".0f", nticks=5, row=2, col=1)
+                        fig.update_yaxes(tickformat=".2f", nticks=5, row=1, col=1)
+                        st.plotly_chart(fig, use_container_width=True)
+
+                    with col_info:
+                        # 右侧详情展示
+                        st.write("") # 占位
                         try:
                             ddf = wrap(detail_df.copy())
                             _ = ddf.get("kdj"); _ = ddf.get("macd"); _ = ddf.get("atr")
+                            
+                            st.markdown("#### 核心指标")
+                            
+                            # 🌟 第一行：最新价、ATR%、MACD
                             m1 = st.columns(3)
                             m1[0].metric("最新价", round(detail_df["close"].iloc[-1], 2))
-                            m1[1].metric("日K", round(ddf["kdjk"].iloc[-1], 2))
-                            m1[2].metric("日D", round(ddf["kdjd"].iloc[-1], 2))
+                            m1[1].metric("ATR%", round(ddf["atr"].iloc[-1] / detail_df["close"].iloc[-1] * 100, 2))
+                            m1[2].metric("MACD", round(ddf["macd"].iloc[-1], 3))
+                            
+                            # 🌟 第二行：日K、日D、日J
                             m2 = st.columns(3)
-                            m2[0].metric("日J", round(ddf["kdjj"].iloc[-1], 2))
-                            m2[1].metric("MACD", round(ddf["macd"].iloc[-1], 3))
-                            m2[2].metric("ATR%", round(ddf["atr"].iloc[-1] / detail_df["close"].iloc[-1] * 100, 2))
+                            m2[0].metric("日K", round(ddf["kdjk"].iloc[-1], 2))
+                            m2[1].metric("日D", round(ddf["kdjd"].iloc[-1], 2))
+                            m2[2].metric("日J", round(ddf["kdjj"].iloc[-1], 2))
+                            
                         except Exception:
                             pass
+                            
+                        st.divider()
+                        st.markdown("#### 📋 近5日量价")
                         recent = detail_df.tail(5)[["date", "open", "high", "low", "close", "volume"]].copy()
                         recent["date"] = recent["date"].dt.strftime("%Y-%m-%d")
                         recent.columns = ["日期", "开盘", "最高", "最低", "收盘", "成交量"]
-                        st.dataframe(recent, width="stretch"
-
-, hide_index=True)
-                    else:
-                        st.warning("无法加载K线数据。")
-                    # --- 原本的代码结束 ---
-                    
+                        st.dataframe(recent, width="stretch", hide_index=True)
+                        
                 else:
-                    # 如果越界了（即上面说的筛选后行数变少的情况）
-                    st.info("👈 筛选结果已更新，请重新点击左侧表格行查看详情。")
+                    st.warning("无法加载K线数据。")
             else:
-                st.info("👈 点击左侧表格行查看详情。")
+                st.info("👈 筛选结果已更新，请重新点击表格行查看详情。")
+        else:
+            st.info("👈 点击上方表格行查看详情。")
     else:
         st.warning("⚠️ 没有股票满足条件。")
         if all_scanned:
@@ -2376,34 +2527,28 @@ else:
     with del_col3:
         st.write("")
         st.write("")
-        if st.button("⚠️ 清空全部", key="btn_del_all", width="stretch"):
-            if clear_all_history():
-                st.success("已清空全部历史记录")
-                st.rerun()
-            else:
-                st.error("清空失败，请重试。")
+        # 🌟 修改按钮文字，让用户明确知道这是只删未回测的
+        if st.button("🧹 清空未回测记录", key="btn_del_all", width="stretch", help="点击后只删除【未回测】的历史记录，带绿勾✅的已回测数据将安全保留。"):
+            st.session_state["confirm_clear_all"] = True
+            st.rerun()
 
-    # 🌟 分离出来的二次确认逻辑
-    if "pending_delete_target" in st.session_state:
-        target = st.session_state["pending_delete_target"]
-        st.error(f"⚠️ 警告：你选择删除的是一条【已回测】数据，删除后将无法找回回测明细！")
-        
-        confirm_col1, confirm_col2 = st.columns([1, 4])
-        with confirm_col1:
-            if st.button("确认删除", type="primary", key="btn_confirm_del_bt", width="stretch"):
-                try:
-                    hid = int(target.split(" ")[0].replace("#", ""))
-                    if delete_history(hid):
-                        st.success(f"已彻底删除记录 #{hid}")
-                        del st.session_state["pending_delete_target"] # 清除状态
-                        st.rerun()
-                except Exception as e:
-                    st.error(f"删除出错：{e}")
-        with confirm_col2:
-            if st.button("取消", key="btn_cancel_del_bt", width="stretch"):
-                del st.session_state["pending_delete_target"] # 清除状态
+    # 🌟 修改后的二次确认面板
+    if st.session_state.get("confirm_clear_all", False):
+        st.warning("⚠️ 确认操作：你即将清空【所有未回测】的历史流水记录，**所有带 ✅ 已回测的数据将被安全保留**！")
+        cc1, cc2 = st.columns([1, 4])
+        with cc1:
+            if st.button("确认清理", type="primary", key="btn_confirm_clear_all", width="stretch"):
+                # 👇 调用刚才新增的只删未回测的函数
+                if clear_unbacktested_history():
+                    st.success("已成功清空所有未回测的历史记录！")
+                    del st.session_state["confirm_clear_all"] # 清除状态
+                    st.rerun()
+                else:
+                    st.error("清空失败，请重试。")
+        with cc2:
+            if st.button("取消", key="btn_cancel_clear_all", width="stretch"):
+                del st.session_state["confirm_clear_all"] # 清除状态
                 st.rerun()
-
     # ==========================================
     # 以下是你的【查看某次详情】逻辑，原封不动保留
     # ==========================================
@@ -2866,7 +3011,7 @@ else:
                 else:
                     bt_df = pd.DataFrame(bt_rows)
                     
-                    # ====== 新增：标记该历史记录已被回测 ======
+                    # ====== 标记该历史记录已被回测 ======
                     try:
                         conn = sqlite3.connect(get_history_db_path())
                         conn.execute("UPDATE screening_history SET is_backtested = 1 WHERE id = ?", (hid,))
@@ -2876,88 +3021,89 @@ else:
                         pass
                     # ==========================================
 
-                    # 🌟 关键修复：如果发现所有行都是空的（说明没有未来数据），提示用户
+                    # 🌟 智能判断：如果发现所有收益率均为空
                     if bt_df[f"{hold_days[0]}日毛收益%"].dropna().empty:
-                        st.error("🚨 回测失败：所有的收益率均为空。请检查你的【回测基准日】是否晚于当前真实日期！")
+                        today_date = pd.Timestamp.today().normalize()
+                        if screen_date >= today_date:
+                            st.warning(f"⏳ **暂无可回测数据**：该记录是 **今天 ({screen_date.strftime('%Y-%m-%d')})** 筛选出来的。回测需要看未来的涨跌，请等待几个交易日后，再回来点击回测，届时就能看到真实的收益数据啦！")
+                        else:
+                            st.error("🚨 回测失败：所有的收益率均为空。可能是因为股票停牌，或者K线缓存中没有未来的数据。")
                     else:
+                        # 只有有数据的时候，才执行统计
                         st.markdown("### 📊 汇总统计")
-                # ==========================================
-                    stats = []
-                    for n in hold_days:
-                        col = f"{n}日净收益%"
-                        if col not in bt_df.columns:
-                            continue
-                        valid = bt_df[col].dropna()
-                        if len(valid) == 0:
-                            continue
-                        wins = valid[valid > 0]
-                        losses = valid[valid < 0]
-                        pnl_ratio = None
-                        if len(wins) > 0 and len(losses) > 0:
-                            pnl_ratio = round(wins.mean() / abs(losses.mean()), 2)
+                        
+                        stats = []
+                        for n in hold_days:
+                            col = f"{n}日净收益%"
+                            if col not in bt_df.columns:
+                                continue
+                            valid = bt_df[col].dropna()
+                            if len(valid) == 0:
+                                continue
+                            wins = valid[valid > 0]
+                            losses = valid[valid < 0]
+                            pnl_ratio = None
+                            if len(wins) > 0 and len(losses) > 0:
+                                pnl_ratio = round(wins.mean() / abs(losses.mean()), 2)
 
-                        bench_ret = bench_returns.get(n)
-                        excess = None
-                        if bench_ret is not None:
-                            excess = round(valid.mean() - bench_ret, 2)
+                            bench_ret = bench_returns.get(n)
+                            excess = None
+                            if bench_ret is not None:
+                                excess = round(valid.mean() - bench_ret, 2)
 
-                        stats.append({
-                            "持有期": f"{n}日",
-                            "样本数": len(valid),
-                            "平均净收益%": round(valid.mean(), 2),
-                            "胜率%": round((valid > 0).sum() / len(valid) * 100, 2),
-                            "最大盈利%": round(valid.max(), 2),
-                            "最大亏损%": round(valid.min(), 2),
-                            "盈亏比": pnl_ratio,
-                            "沪深300同期%": bench_ret,
-                            "超额收益%": excess,
-                        })
+                            stats.append({
+                                "持有期": f"{n}日",
+                                "样本数": len(valid),
+                                "平均净收益%": round(valid.mean(), 2),
+                                "胜率%": round((valid > 0).sum() / len(valid) * 100, 2),
+                                "最大盈利%": round(valid.max(), 2),
+                                "最大亏损%": round(valid.min(), 2),
+                                "盈亏比": pnl_ratio,
+                                "沪深300同期%": bench_ret,
+                                "超额收益%": excess,
+                            })
 
-                    if stats:
-                        stats_df = pd.DataFrame(stats)
-                        st.dataframe(
-                            stats_df,
-                            width="stretch"
+                        if stats:
+                            stats_df = pd.DataFrame(stats)
+                            st.dataframe(
+                                stats_df,
+                                width="stretch",
+                                hide_index=True,
+                                column_config={
+                                    "持有期": st.column_config.TextColumn("持有期", width="small"),
+                                    "样本数": st.column_config.NumberColumn("样本数", width="small"),
+                                    "平均净收益%": st.column_config.NumberColumn("平均净收益%", format="%.2f"),
+                                    "胜率%": st.column_config.NumberColumn("胜率%", format="%.2f"),
+                                    "最大盈利%": st.column_config.NumberColumn("最大盈利%", format="%.2f"),
+                                    "最大亏损%": st.column_config.NumberColumn("最大亏损%", format="%.2f"),
+                                    "盈亏比": st.column_config.NumberColumn("盈亏比", format="%.2f"),
+                                    "沪深300同期%": st.column_config.NumberColumn("沪深300同期%", format="%.2f"),
+                                    "超额收益%": st.column_config.NumberColumn("超额收益%", format="%.2f"),
+                                },
+                            )
 
-,
-                            hide_index=True,
-                            column_config={
-                                "持有期": st.column_config.TextColumn("持有期", width="small"),
-                                "样本数": st.column_config.NumberColumn("样本数", width="small"),
-                                "平均净收益%": st.column_config.NumberColumn("平均净收益%", format="%.2f"),
-                                "胜率%": st.column_config.NumberColumn("胜率%", format="%.2f"),
-                                "最大盈利%": st.column_config.NumberColumn("最大盈利%", format="%.2f"),
-                                "最大亏损%": st.column_config.NumberColumn("最大亏损%", format="%.2f"),
-                                "盈亏比": st.column_config.NumberColumn("盈亏比", format="%.2f"),
-                                "沪深300同期%": st.column_config.NumberColumn("沪深300同期%", format="%.2f"),
-                                "超额收益%": st.column_config.NumberColumn("超额收益%", format="%.2f"),
-                            },
+                            st.caption(
+                                "💡 **盈亏比**：平均盈利 ÷ 平均亏损。>1 表示赚的比亏的多。\n"
+                                "💡 **超额收益**：策略平均收益 − 沪深300同期涨幅。>0 表示跑赢大盘。"
+                            )
+
+                        st.markdown("### 📋 每只股票明细")
+                        net_cols = [f"{n}日净收益%" for n in hold_days if f"{n}日净收益%" in bt_df.columns]
+                        show_cols = ["代码", "名称", "综合评分", "筛选日价格"] + net_cols + ["最大涨幅%", "最大回撤%"]
+                        show_cols = [c for c in show_cols if c in bt_df.columns]
+                        bt_display = bt_df[show_cols].sort_values("综合评分", ascending=False)
+
+                        st.dataframe(bt_display, width="stretch", height=420)
+
+                        csv_bt = bt_df.to_csv(index=False, encoding="utf-8-sig")
+                        st.download_button(
+                            "📥 下载回测明细 CSV",
+                            data=csv_bt,
+                            file_name=f"回测明细_{screen_date.strftime('%Y%m%d')}.csv",
+                            mime="text/csv",
                         )
 
                         st.caption(
-                            "💡 **盈亏比**：平均盈利 ÷ 平均亏损。>1 表示赚的比亏的多。\n"
-                            "💡 **超额收益**：策略平均收益 − 沪深300同期涨幅。>0 表示跑赢大盘。"
+                            f"💡 卖出价用的是筛选日之后第 N 个交易日的收盘价，"
+                            f"已扣除 {cost_pct}% 的双边交易成本。未考虑停牌、涨跌停无法成交等情况。"
                         )
-
-                    st.markdown("### 📋 每只股票明细")
-                    net_cols = [f"{n}日净收益%" for n in hold_days if f"{n}日净收益%" in bt_df.columns]
-                    show_cols = ["代码", "名称", "综合评分", "筛选日价格"] + net_cols + ["最大涨幅%", "最大回撤%"]
-                    show_cols = [c for c in show_cols if c in bt_df.columns]
-                    bt_display = bt_df[show_cols].sort_values("综合评分", ascending=False)
-
-                    st.dataframe(bt_display, width="stretch"
-
-, height=420)
-
-                    csv_bt = bt_df.to_csv(index=False, encoding="utf-8-sig")
-                    st.download_button(
-                        "📥 下载回测明细 CSV",
-                        data=csv_bt,
-                        file_name=f"回测明细_{screen_date.strftime('%Y%m%d')}.csv",
-                        mime="text/csv",
-                    )
-
-                    st.caption(
-                        f"💡 卖出价用的是筛选日之后第 N 个交易日的收盘价，"
-                        f"已扣除 {cost_pct}% 的双边交易成本。未考虑停牌、涨跌停无法成交等情况。"
-                    )
