@@ -6,3 +6,4 @@ numpy
 stockstats
 openpyxl
 pyarrow
+plotly
